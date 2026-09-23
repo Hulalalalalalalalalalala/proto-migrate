@@ -21,7 +21,17 @@ import json
 import math
 from collections.abc import Mapping
 
-__all__ = ["VERSIONS", "CURRENT_VERSION", "dumps", "loads", "migrate"]
+__all__ = [
+    "VERSIONS",
+    "CURRENT_VERSION",
+    "dumps",
+    "loads",
+    "migrate",
+    "migrate_log_file",
+    "BadRecordError",
+    "MigrationResult",
+    "run_cli",
+]
 
 VERSIONS = (1, 2, 3)
 CURRENT_VERSION = 3
@@ -147,3 +157,11 @@ def migrate(message, target_version):
         else:
             result[name] = _default(name)
     return result
+
+
+from .log_migration import (  # noqa: E402
+    BadRecordError,
+    MigrationResult,
+    migrate_log_file,
+    run_cli,
+)

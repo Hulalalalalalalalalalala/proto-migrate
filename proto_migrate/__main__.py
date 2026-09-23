@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from . import CURRENT_VERSION, VERSIONS, dumps, loads, migrate
+from . import CURRENT_VERSION, VERSIONS, dumps, loads, migrate, run_cli
 
 
 def _selftest():
@@ -89,7 +89,13 @@ def main(argv=None):
         _selftest()
         print("ok")
         return 0
-    print("usage: python3 -m proto_migrate --selftest", file=sys.stderr)
+    if args and args[0] == "migrate-log":
+        return run_cli(args[1:])
+    print(
+        "usage: python3 -m proto_migrate --selftest\n"
+        "       python3 -m proto_migrate migrate-log FILE [--strict|--skip]",
+        file=sys.stderr,
+    )
     return 2
 
 
