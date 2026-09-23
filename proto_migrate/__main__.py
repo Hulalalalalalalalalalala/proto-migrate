@@ -1,10 +1,21 @@
-"""Command-line entry point: python3 -m proto_migrate --selftest."""
+"""Command-line entry point.
+
+    python3 -m proto_migrate --selftest
+    python3 -m proto_migrate migrate-log FILE [--mode strict|skip]
+"""
 
 from __future__ import annotations
 
 import sys
 
 from . import CURRENT_VERSION, VERSIONS, dumps, loads, migrate
+from .log_migrate import (
+    EXIT_BAD_RECORD,
+    LOG_SKIP,
+    LOG_STRICT,
+    BadRecordError,
+    migrate_log,
+)
 
 
 def _selftest():
@@ -83,13 +94,81 @@ def _selftest():
             raise AssertionError("expected TypeError")
 
 
+def _migrate_log(argv):
+    mode = LOG_STRICT
+    positional = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--mode", "-m"):
+            i += 1
+            if i >= len(argv):
+                print("migrate-log: --mode requires a value", file=sys.stderr)
+                return 2
+            mode = argv[i]
+        elif arg.startswith("--mode="):
+            mode = arg.split("=", 1)[1]
+        elif arg in ("-h", "--help"):
+            print(
+                "usage: python3 -m proto_migrate migrate-log FILE "
+                "[--mode strict|skip]",
+                file=sys.stderr,
+            )
+            return 2
+        else:
+            positional.append(arg)
+        i += 1
+
+    if mode not in (LOG_STRICT, LOG_SKIP):
+        print(
+            f"migrate-log: invalid mode {mode!r} (expected 'strict' or 'skip')",
+            file=sys.stderr,
+        )
+        return 2
+    if len(positional) != 1:
+        print(
+            "usage: python3 -m proto_migrate migrate-log FILE "
+            "[--mode strict|skip]",
+            file=sys.stderr,
+        )
+        return 2
+
+    path = positional[0]
+    try:
+        result = migrate_log(path, mode=mode, audit_stream=sys.stderr.buffer)
+    except FileNotFoundError:
+        print(f"migrate-log: file not found: {path}", file=sys.stderr)
+        return 2
+    except BadRecordError as exc:
+        # Strict mode: first bad line, original file untouched.
+        print(f"migrate-log: {exc}", file=sys.stderr)
+        return EXIT_BAD_RECORD
+    except OSError as exc:
+        print(f"migrate-log: {exc}", file=sys.stderr)
+        return 2
+
+    what = "migrated" if result.changed else "already up to date"
+    print(
+        f"{what}: {result.total_lines} lines, "
+        f"{result.migrated_lines} converted, {result.skipped} skipped"
+    )
+    return 0
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--selftest"]:
         _selftest()
         print("ok")
         return 0
+    if args and args[0] == "migrate-log":
+        return _migrate_log(args[1:])
     print("usage: python3 -m proto_migrate --selftest", file=sys.stderr)
+    print(
+        "       python3 -m proto_migrate migrate-log FILE "
+        "[--mode strict|skip]",
+        file=sys.stderr,
+    )
     return 2
 
 
