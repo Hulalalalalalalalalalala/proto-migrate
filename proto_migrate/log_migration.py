@@ -79,16 +79,47 @@ the path by name during wrap-up.
 Idempotency: if every record is already at the current version in
 canonical encoding and nothing is skipped, the file is left byte-for-byte
 untouched (no rename, no rewrite, no mtime change).
+
+Group migration
+---------------
+:func:`migrate_log_group` migrates an explicitly given set of logs as
+one all-or-nothing unit: either every member ends at the current
+version or no member's original file is modified, and the persistent
+state never shows a partially migrated group.  Every member is first
+migrated into its own segment files and local checkpoints, ending with
+a durable per-member ``prepared`` record; only when ALL members are
+prepared does a durable group commit record
+(``<first member>.migrate-group/commit``) authorize the unified rename
+sequence -- the atomic decision of a cross-file two-phase protocol.
+Each finished rename is recorded as a durable ``done`` line.
+
+  * killed before the commit record: no original file has changed; the
+    rerun resumes every member from its checkpoints (fully prepared
+    members are neither rescanned nor rewritten) and finishes
+    byte-identical to one uninterrupted run, and a pre-commit failure
+    rolls the whole group back without a trace;
+  * killed after the commit record: the rerun completes the remaining
+    renames from the record -- it never rolls renames back.
+
+:func:`read_log_group` returns one consistent snapshot of the whole
+group: while no member's commit marker exists every member is decoded
+as stored; as soon as any marker exists every member is normalized to
+the current version, so old and new field shapes never mix inside the
+view -- within or between members, even while a writer reopens a path
+after wrap-up.  The group summary counts only records newly migrated
+during the run itself.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import shutil
 import sys
 import time
+from collections.abc import Sequence
 from typing import NamedTuple
 
 from . import CURRENT_VERSION, dumps, loads, migrate
@@ -96,9 +127,13 @@ from . import CURRENT_VERSION, dumps, loads, migrate
 __all__ = [
     "BadRecordError",
     "MigrationResult",
+    "GroupMigrationResult",
     "migrate_log_file",
+    "migrate_log_group",
     "read_log",
+    "read_log_group",
     "run_cli",
+    "run_group_cli",
     "EXIT_OK",
     "EXIT_ERROR",
     "EXIT_USAGE",
@@ -117,7 +152,9 @@ EXIT_BAD_RECORD = 3
 # process kills itself (os._exit, no cleanup) upon reaching it, to
 # simulate a crash mid-migration.  Checkpoints: "lock", "marker",
 # "checkpoint" (alias "segment"), "segments", "assemble", "drain",
-# "replace", "dirfsync", "committed", "converge", "cleanup".
+# "replace", "dirfsync", "committed", "converge", "cleanup"; group
+# migration adds "group-lock", "group-prepare", "group-segments",
+# "group-commit", "group-rename", "group-converge" and "group-cleanup".
 _CRASH_ENV = "PROTO_MIGRATE_CRASH_AT"
 # Testing hook: when this names a post-commit step ("dirfsync" or
 # "cleanup"), that step raises OSError instead of running, so tests can
@@ -227,19 +264,27 @@ def _convert(raw):
     return dumps({k: v for k, v in upgraded.items() if k != "v"})
 
 
-def _audit_line(lineno, raw):
+def _audit_line(lineno, raw, *, label=None):
     line = raw[:-1] if raw.endswith(b"\n") else raw
-    return str(lineno).encode("ascii") + b":" + line[:_AUDIT_SNIPPET] + b"\n"
+    prefix = b"" if label is None else os.fsencode(label) + b":"
+    return (prefix + str(lineno).encode("ascii") + b":"
+            + line[:_AUDIT_SNIPPET] + b"\n")
 
 
-def _emit(audit_stream, on_bad, raw, lineno):
-    """Convert one line; return (output bytes or None, was_bad)."""
+def _emit(audit_stream, on_bad, raw, lineno, *, label=None):
+    """Convert one line; return (output bytes or None, was_bad).
+
+    *label* prefixes the skip-audit entry with a member name; the group
+    migration passes the member path so one shared stderr stream stays
+    attributable.  Single-file callers omit it and get the historical
+    ``<lineno>:<bytes>`` format.
+    """
     try:
         out = _convert(raw)
     except ValueError as exc:
         if on_bad == "strict":
             raise BadRecordError(lineno, raw, exc) from exc
-        audit_stream.write(_audit_line(lineno, raw))
+        audit_stream.write(_audit_line(lineno, raw, label=label))
         audit_stream.flush()
         return None, True
     return out, False
@@ -540,7 +585,7 @@ def _available_lines(fd, off):
 
 
 def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
-              audit_stream, on_bad):
+              audit_stream, on_bad, *, label=None):
     """Drain appenders across the commit.
 
     Returns ``(salvaged, skipped, lineno, warning)``.  A repair I/O
@@ -604,7 +649,8 @@ def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
 
     def convert_into(buf, raw):
         nonlocal salvaged_records
-        out, bad = _emit(audit_stream, on_bad, raw, lineno_box[0])
+        out, bad = _emit(audit_stream, on_bad, raw, lineno_box[0],
+                         label=label)
         lineno_box[0] += 1
         if bad:
             skipped_box[0] += 1
@@ -981,6 +1027,726 @@ def read_log(path, *, quiesce=DEFAULT_QUIESCE):
 
 
 # ---------------------------------------------------------------------------
+# Group migration: one all-or-nothing pass over an explicit set of logs
+# ---------------------------------------------------------------------------
+#
+# Every member is first migrated into its own segment files and local
+# checkpoints (the single-file machinery), finishing with a durable
+# per-member ``prepared`` record.  Only when ALL members are prepared
+# does the run publish a group commit record in
+# ``<first member>.migrate-group/commit`` -- the atomic decision of the
+# two-phase protocol.  Phase two then renames each member's assembled
+# output over its original, recording every finished rename as a
+# durable ``done`` line in the commit record.
+#
+# A process killed before the commit record is durable has changed no
+# original file: the rerun resumes each member from its checkpoints
+# (fully prepared members are neither rescanned nor rewritten) or, on a
+# pre-commit failure, the whole group rolls back without a trace.  A
+# kill after the commit record is finished by the rerun from the record
+# itself: remaining renames are completed, never rolled back.
+
+
+class GroupMigrationResult(NamedTuple):
+    results: tuple  # one MigrationResult per member, in manifest order
+    records_migrated: int
+    records_skipped: int
+    records_salvaged: int
+    replaced: int  # members whose original was atomically replaced
+    post_commit_error: str | None = None
+
+
+_GROUP_DIR_SUFFIX = ".migrate-group"
+_GROUP_COMMIT_NAME = "commit"
+_PREPARED_NAME = "prepared"
+
+
+def _validate_manifest(paths):
+    """Check the explicit member manifest shared by both group entries."""
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
+        raise TypeError("paths must be a sequence of filesystem paths")
+    paths = [os.fspath(p) for p in paths]
+    if not paths:
+        raise ValueError("paths must name at least one log file")
+    seen = set()
+    for p in paths:
+        ap = os.path.abspath(p)
+        if ap in seen:
+            raise ValueError(f"duplicate path in manifest: {p!r}")
+        seen.add(ap)
+    return paths
+
+
+def _require_readable(paths):
+    """Raise FileNotFoundError for any missing or unreadable member."""
+    for p in paths:
+        try:
+            with open(p, "rb"):
+                pass
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise FileNotFoundError(
+                2, f"log file is missing or unreadable: "
+                f"{exc.strerror or exc}", p) from exc
+
+
+def _write_prepared(tmp_dir, inode, mode, offset, migrated, skipped,
+                    lineno, final_size):
+    """Durably record that a member's assembled output is commit-ready."""
+    line = (f"prepared {inode} {mode} {offset} {migrated} {skipped} "
+            f"{lineno} {final_size}\n").encode("ascii")
+    with open(os.path.join(tmp_dir, _PREPARED_NAME), "wb") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(tmp_dir)
+
+
+def _read_prepared(tmp_dir):
+    """Return the prepared record as a dict, or None if absent/torn."""
+    try:
+        with open(os.path.join(tmp_dir, _PREPARED_NAME), "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not data.endswith(b"\n"):
+        return None
+    try:
+        parts = data[:-1].decode("ascii").split(" ")
+    except UnicodeDecodeError:
+        return None
+    if (len(parts) != 8 or parts[0] != "prepared"
+            or parts[2] not in ("strict", "skip")):
+        return None
+    numbers = (parts[1],) + tuple(parts[3:])
+    if not all(x.isdigit() for x in numbers):
+        return None
+    return {
+        "inode": int(parts[1]),
+        "mode": parts[2],
+        "offset": int(parts[3]),
+        "migrated": int(parts[4]),
+        "skipped": int(parts[5]),
+        "lineno": int(parts[6]),
+        "final_size": int(parts[7]),
+    }
+
+
+def _read_group_commit(group_dir):
+    """Return ``{"members": [...], "done": set()}`` or None.
+
+    The header fixes the member count; a commit record that does not
+    parse up to exactly that many member lines was torn before the
+    commit decision became durable, so no rename can have started and
+    the caller treats it as absent.  A torn ``done`` tail only replays
+    renames, which are idempotent.
+    """
+    try:
+        with open(os.path.join(group_dir, _GROUP_COMMIT_NAME), "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    expected = None
+    members = []
+    done = set()
+    for line in data.splitlines():
+        try:
+            rec = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            break  # torn tail: ignore everything from here on
+        if not isinstance(rec, dict):
+            break
+        if expected is None:
+            if (not isinstance(rec.get("group"), int)
+                    or rec["group"] <= 0
+                    or rec.get("mode") not in ("strict", "skip")):
+                break
+            expected = rec["group"]
+            continue
+        if "member" in rec:
+            try:
+                idx = rec["member"]
+                path = rec["path"]
+                src = rec["src"]
+                fin = rec["final"]
+                if not (isinstance(idx, int) and isinstance(path, str)
+                        and isinstance(src, int) and isinstance(fin, int)):
+                    raise ValueError
+            except (KeyError, ValueError):
+                break
+            if idx != len(members):
+                break
+            members.append({"path": path, "src": src, "final": fin})
+            continue
+        if "done" in rec:
+            idx = rec["done"]
+            if not isinstance(idx, int) or not 0 <= idx < len(members):
+                break
+            done.add(idx)
+            continue
+        break
+    if expected is None or len(members) != expected:
+        return None
+    return {"members": members, "done": done}
+
+
+def _publish_commit_marker(path, parent):
+    """Publish and fsync the commit marker gating consistent readers."""
+    marker = _commit_marker_path(path)
+    marker_tmp = marker + ".tmp"
+    with open(marker_tmp, "wb") as mf:
+        mf.write(b"1\n")
+        mf.flush()
+        os.fsync(mf.fileno())
+    os.replace(marker_tmp, marker)
+    _fsync_dir(parent)
+
+
+def _new_group_member(path, abspath):
+    return {
+        "path": path,
+        "abspath": abspath,
+        "parent": os.path.dirname(abspath),
+        "tmp_dir": path + ".migrate-tmp",
+        "src": None,
+        "writer": None,
+        "cp_fh": None,
+        "offset": 0,
+        "lineno": 0,
+        "src_inode": None,
+        "run_migrated": 0,
+        "run_skipped": 0,
+        "salvaged": 0,
+        "dirty": False,
+        "replaced": False,
+        "final": None,
+        "final_inode": None,
+        "commit_index": None,
+        "warning": None,
+    }
+
+
+def _close_group_member(m):
+    writer = m["writer"]
+    if writer is not None:
+        writer.abort()
+        m["writer"] = None
+    for key in ("src", "cp_fh"):
+        fh = m[key]
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+            m[key] = None
+
+
+def _prepare_group_member(m, on_bad, segment_size, quiesce, audit_stream,
+                          follow_window):
+    """Scan and drain one member up to (not including) the group commit.
+
+    Fills *m* in place.  Afterwards the member is either clean (no
+    rewrite needed, nothing to commit) or commit-ready: its assembled
+    output and a durable prepared record wait in its work directory and
+    its source descriptor stays open for the post-commit convergence.
+    """
+    path = m["path"]
+    tmp_dir = m["tmp_dir"]
+    # A marker.tmp left by a crash between its creation and the atomic
+    # rename is stale and would otherwise linger.
+    try:
+        os.unlink(_commit_marker_path(path) + ".tmp")
+    except FileNotFoundError:
+        pass
+    st = os.stat(path)
+    m["src_inode"] = st.st_ino
+
+    prepared = _read_prepared(tmp_dir)
+    if prepared is not None:
+        final = os.path.join(tmp_dir, "final")
+        if (prepared["inode"] == st.st_ino and prepared["mode"] == on_bad
+                and os.path.isfile(final)
+                and os.path.getsize(final) == prepared["final_size"]):
+            # Fully scanned and drained by a previous run: neither
+            # rescan nor rewrite, the assembled output is reused as is.
+            m["offset"] = prepared["offset"]
+            m["lineno"] = prepared["lineno"]
+            m["dirty"] = True
+            m["final"] = final
+            m["src"] = open(path, "rb")
+            return m
+
+    state = _prepare_workdir(path, tmp_dir, segment_size, st.st_ino, on_bad)
+    writer = m["writer"] = state["writer"]
+    cp_fh = m["cp_fh"] = state["cp_fh"]
+    offset = state["offset"]
+    migrated = state["count"]
+    skipped = state["skipped"]
+    dirty = state["dirty"]
+    m["lineno"] = lineno = migrated + skipped
+    src = m["src"] = open(path, "rb")
+
+    # --- SCAN: identical protocol to the single-file migration, but
+    # only records converted during this run count towards the summary.
+    for raw in _read_lines(src, quiesce, offset=offset,
+                           follow=follow_window):
+        lineno += 1
+        offset += len(raw)
+        out, bad = _emit(audit_stream, on_bad, raw, lineno, label=path)
+        if bad:
+            skipped += 1
+            m["run_skipped"] += 1
+            dirty = True
+            continue
+        if raw != out:
+            dirty = True
+        writer.write(out)
+        migrated += 1
+        m["run_migrated"] += 1
+        if writer.size >= writer.limit:
+            name = writer.current_segment
+            writer.close()
+            _publish_prefix_checkpoint(
+                cp_fh, tmp_dir, offset, migrated, skipped, dirty, name,
+                os.path.getsize(os.path.join(tmp_dir, name)))
+
+    if writer.has_open_segment:
+        name = writer.current_segment
+        writer.close()
+        _publish_prefix_checkpoint(
+            cp_fh, tmp_dir, offset, migrated, skipped, dirty, name,
+            os.path.getsize(os.path.join(tmp_dir, name)))
+    _crash_point("group-segments")
+
+    m["offset"] = offset
+    m["lineno"] = lineno
+    m["dirty"] = dirty
+    cp_fh.close()
+    m["cp_fh"] = None
+
+    if not dirty:
+        # Canonical current-version file, nothing skipped: leave every
+        # byte untouched; this member needs no commit.
+        _close_group_member(m)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return m
+
+    final = _assemble(tmp_dir, _segment_names(tmp_dir),
+                      os.path.join(tmp_dir, "final"))
+
+    # --- DRAIN: migrate everything appended since the scan ended,
+    # bounded by the same follow window as the single-file migration.
+    with open(final, "ab") as out_fh:
+        tail_added = 0
+        for raw in _read_lines(src, quiesce, offset=offset,
+                               follow=follow_window):
+            lineno += 1
+            offset += len(raw)
+            out, bad = _emit(audit_stream, on_bad, raw, lineno, label=path)
+            if bad:
+                skipped += 1
+                m["run_skipped"] += 1
+                continue
+            out_fh.write(out)
+            migrated += 1
+            m["run_migrated"] += 1
+            tail_added += 1
+        if tail_added:
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+    m["offset"] = offset
+    m["lineno"] = lineno
+
+    _write_prepared(tmp_dir, m["src_inode"], on_bad, offset, migrated,
+                    skipped, lineno, os.path.getsize(final))
+    m["final"] = final
+    return m
+
+
+def _converge_group_member(m, quiesce, audit_stream, on_bad, warnings):
+    """Drain appenders racing a member's commit; faults are warnings."""
+    src = m["src"]
+    if src is None:
+        return
+    try:
+        salvaged, conv_skipped, lineno, warning = _converge(
+            m["path"], m["parent"], m["tmp_dir"], src, m["offset"],
+            m["lineno"], quiesce, audit_stream, on_bad, label=m["path"],
+        )
+    finally:
+        try:
+            src.close()
+        except OSError:
+            pass
+        m["src"] = None
+    m["salvaged"] += salvaged
+    m["run_skipped"] += conv_skipped
+    m["lineno"] = lineno
+    if warning:
+        m["warning"] = m["warning"] or warning
+        warnings.append(f"{m['path']}: {warning}")
+
+
+def _recover_group_commit(commit_state, group_dir, on_bad, warnings):
+    """Finish a durable group commit interrupted mid-rename.
+
+    Every recorded member whose rename has not landed (its path still
+    resolves to the recorded source inode) is renamed now; a member
+    whose path already resolves to the recorded output inode only gets
+    its ``done`` line rewritten.  Returns the member dicts renamed
+    during this run so the caller can converge their racing appenders.
+    """
+    renamed = []
+    commit_fh = open(os.path.join(group_dir, _GROUP_COMMIT_NAME), "ab")
+    dirfsync_fault_used = False
+    try:
+        for idx, rec in enumerate(commit_state["members"]):
+            if idx in commit_state["done"]:
+                continue
+            path = rec["path"]
+            tmp_dir = path + ".migrate-tmp"
+            prepared = _read_prepared(tmp_dir)
+            if prepared is None:
+                raise OSError(
+                    "group commit recovery: missing prepared state for "
+                    f"{path}")
+            cur_ino = os.stat(path).st_ino
+            if cur_ino == rec["final"]:
+                # The rename landed before the interruption; only the
+                # done record was lost.
+                pass
+            elif cur_ino == rec["src"]:
+                final = os.path.join(tmp_dir, "final")
+                if (not os.path.isfile(final)
+                        or os.path.getsize(final) != prepared["final_size"]):
+                    raise OSError(
+                        "group commit recovery: missing assembled output "
+                        f"for {path}")
+                parent = os.path.dirname(path)
+                src = open(path, "rb")
+                _publish_commit_marker(path, parent)
+                os.replace(final, path)
+                _crash_point("group-rename")
+                try:
+                    if (not dirfsync_fault_used
+                            and os.environ.get(_FAULT_ENV) == "dirfsync"):
+                        dirfsync_fault_used = True
+                        raise OSError("injected directory fsync fault")
+                    _fsync_dir(parent)
+                except OSError as exc:
+                    warnings.append(
+                        f"{path}: directory fsync failed: {exc}")
+                renamed.append({
+                    "path": path,
+                    "parent": parent,
+                    "tmp_dir": tmp_dir,
+                    "src": src,
+                    "offset": prepared["offset"],
+                    "lineno": prepared["lineno"],
+                    "salvaged": 0,
+                    "run_skipped": 0,
+                    "warning": None,
+                })
+            else:
+                raise OSError(
+                    "group commit recovery: member changed externally "
+                    f"while the group commit was pending: {path}")
+            commit_fh.seek(0, os.SEEK_END)
+            commit_fh.write(json.dumps({"done": idx}).encode("ascii")
+                            + b"\n")
+            commit_fh.flush()
+            os.fsync(commit_fh.fileno())
+    finally:
+        commit_fh.close()
+    return renamed
+
+
+def _sweep_group_artifacts(member_paths, group_dir, warnings):
+    """Remove work directories after a committed group; never fatal."""
+    try:
+        _crash_point("group-cleanup")
+        if os.environ.get(_FAULT_ENV) == "cleanup":
+            raise OSError("injected cleanup fault")
+        for ap in member_paths:
+            shutil.rmtree(ap + ".migrate-tmp", ignore_errors=True)
+        shutil.rmtree(group_dir, ignore_errors=True)
+    except OSError as exc:
+        warnings.append(f"cleanup failed: {exc}")
+
+
+def _group_result(results, warnings):
+    return GroupMigrationResult(
+        results=tuple(results),
+        records_migrated=sum(r.records_migrated for r in results),
+        records_skipped=sum(r.records_skipped for r in results),
+        records_salvaged=sum(r.records_salvaged for r in results),
+        replaced=sum(1 for r in results if r.replaced),
+        post_commit_error="; ".join(warnings) if warnings else None,
+    )
+
+
+def migrate_log_group(paths, *, on_bad="strict",
+                      segment_size=DEFAULT_SEGMENT_SIZE,
+                      quiesce=DEFAULT_QUIESCE, audit=None):
+    """Migrate a whole set of JSONL logs to the current record version.
+
+    The group is all-or-nothing: either every member ends at the
+    current version or no member's original file is modified, and no
+    partially migrated state is ever left in the persistent files.
+    Every member may be appended to by other processes while this runs.
+
+    Each member is first migrated into its own segment files and local
+    checkpoints; a failure of any member before the commit phase rolls
+    the whole group back to its pre-migration state.  The unified
+    rename sequence is a recoverable two-phase protocol: a durable group
+    commit record (``<first member>.migrate-group/commit``) is the
+    atomic decision, after which a killed run is finished by a rerun
+    completing the remaining renames -- never by rolling renames back.
+    A rerun continues from the per-member checkpoints: prepared members
+    are neither rescanned nor rewritten and the result is byte-for-byte
+    identical to one uninterrupted run.
+
+    The summary counts only records newly migrated during this run.
+    Returns a :class:`GroupMigrationResult`.  In strict mode raises
+    :class:`BadRecordError` at the group's first bad line and leaves
+    every member untouched.
+    """
+    if on_bad not in ("strict", "skip"):
+        raise ValueError(f"on_bad must be 'strict' or 'skip', got {on_bad!r}")
+    if segment_size <= 0:
+        raise ValueError("segment_size must be positive")
+    paths = _validate_manifest(paths)
+    _require_readable(paths)
+    audit_stream = audit if audit is not None else sys.stderr.buffer
+    follow_window = max(1.0, quiesce * 20)
+    abs_paths = [os.path.abspath(p) for p in paths]
+    group_dir = abs_paths[0] + _GROUP_DIR_SUFFIX
+
+    # Probe the commit record only to size the lock set; the
+    # authoritative read happens under the locks.
+    lock_set = set(abs_paths)
+    probe = _read_group_commit(group_dir)
+    if probe is not None:
+        lock_set.update(m["path"] for m in probe["members"])
+
+    locks = []
+    members = []
+    warnings = []
+    recovery_counts = {}
+    committed = False
+    try:
+        for ap in sorted(lock_set):
+            fh = open(ap + ".migrate.lock", "a+b")
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            locks.append(fh)
+        _crash_point("group-lock")
+
+        commit_state = _read_group_commit(group_dir)
+        if commit_state is not None:
+            # A durable commit decision exists: complete the remaining
+            # renames, never roll them back.
+            committed = True
+            renamed = _recover_group_commit(
+                commit_state, group_dir, on_bad, warnings)
+            for m in renamed:
+                _converge_group_member(m, quiesce, audit_stream, on_bad,
+                                       warnings)
+                recovery_counts[m["path"]] = (
+                    m["salvaged"], m["run_skipped"], m["warning"])
+            _sweep_group_artifacts(
+                [m["path"] for m in commit_state["members"]], group_dir,
+                warnings)
+            committed = False  # commit record consumed; artifacts gone
+            if set(m["path"] for m in commit_state["members"]) \
+                    <= set(abs_paths):
+                # The recorded group covers this manifest: members not
+                # in the record needed no rename and are not rescanned.
+                recorded = {m["path"] for m in commit_state["members"]}
+                results = []
+                for p, ap in zip(paths, abs_paths):
+                    salvaged, skipped, warning = recovery_counts.get(
+                        ap, (0, 0, None))
+                    results.append(MigrationResult(
+                        path=p,
+                        records_migrated=0,
+                        records_skipped=skipped,
+                        records_salvaged=salvaged,
+                        replaced=ap in recorded,
+                        post_commit_error=warning,
+                    ))
+                return _group_result(results, warnings)
+            # A different overlapping group left the record: its
+            # renames are done, so fall through and migrate this
+            # manifest as a fresh pass.
+
+        # --- PREPARE: scan and drain every member (resumable) --------
+        for p, ap in zip(paths, abs_paths):
+            m = _new_group_member(p, ap)
+            members.append(m)
+            _prepare_group_member(m, on_bad, segment_size, quiesce,
+                                  audit_stream, follow_window)
+            _crash_point("group-prepare")
+        dirty = [m for m in members if m["dirty"]]
+
+        if dirty:
+            # --- COMMIT phase 1: the durable group decision ----------
+            shutil.rmtree(group_dir, ignore_errors=True)
+            os.makedirs(group_dir)
+            lines = [json.dumps({"group": len(dirty), "mode": on_bad},
+                                separators=(",", ":"))]
+            for idx, m in enumerate(dirty):
+                m["commit_index"] = idx
+                m["final_inode"] = os.stat(m["final"]).st_ino
+                lines.append(json.dumps(
+                    {"member": idx, "path": m["abspath"],
+                     "src": m["src_inode"], "final": m["final_inode"]},
+                    separators=(",", ":")))
+            commit_fh = open(
+                os.path.join(group_dir, _GROUP_COMMIT_NAME), "w+b")
+            try:
+                commit_fh.write(("\n".join(lines) + "\n").encode("utf-8"))
+                commit_fh.flush()
+                os.fsync(commit_fh.fileno())
+                _fsync_dir(group_dir)
+                _fsync_dir(os.path.dirname(group_dir))
+                committed = True
+                _crash_point("group-commit")
+
+                # --- COMMIT phase 2: the unified rename sequence -----
+                dirfsync_fault_used = False
+                for m in dirty:
+                    _publish_commit_marker(m["path"], m["parent"])
+                    os.replace(m["final"], m["path"])
+                    _crash_point("group-rename")
+                    m["replaced"] = True
+                    try:
+                        if (not dirfsync_fault_used
+                                and os.environ.get(_FAULT_ENV)
+                                == "dirfsync"):
+                            dirfsync_fault_used = True
+                            raise OSError(
+                                "injected directory fsync fault")
+                        _fsync_dir(m["parent"])
+                    except OSError as exc:
+                        note = f"directory fsync failed: {exc}"
+                        m["warning"] = m["warning"] or note
+                        warnings.append(f"{m['path']}: {note}")
+                    commit_fh.seek(0, os.SEEK_END)
+                    commit_fh.write(
+                        json.dumps({"done": m["commit_index"]})
+                        .encode("ascii") + b"\n")
+                    commit_fh.flush()
+                    os.fsync(commit_fh.fileno())
+            finally:
+                commit_fh.close()
+
+            # --- CONVERGE with racing appenders, per member ----------
+            for m in dirty:
+                _converge_group_member(m, quiesce, audit_stream, on_bad,
+                                       warnings)
+            _crash_point("group-converge")
+
+        # --- CLEANUP: never turns a committed group into a failure ---
+        try:
+            _crash_point("group-cleanup")
+            if os.environ.get(_FAULT_ENV) == "cleanup":
+                raise OSError("injected cleanup fault")
+            for m in members:
+                shutil.rmtree(m["tmp_dir"], ignore_errors=True)
+            shutil.rmtree(group_dir, ignore_errors=True)
+        except OSError as exc:
+            warnings.append(f"cleanup failed: {exc}")
+    except BaseException:
+        for m in members:
+            _close_group_member(m)
+        if not committed:
+            # Pre-commit: roll the whole group back without a trace.
+            # No rename has run, so every original file is untouched.
+            for m in members:
+                shutil.rmtree(m["tmp_dir"], ignore_errors=True)
+            shutil.rmtree(group_dir, ignore_errors=True)
+        raise
+    finally:
+        for m in members:
+            _close_group_member(m)
+        for fh in locks:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+    results = []
+    for m in members:
+        salvaged, skipped, warning = recovery_counts.get(
+            m["abspath"], (0, 0, None))
+        results.append(MigrationResult(
+            path=m["path"],
+            records_migrated=m["run_migrated"],
+            records_skipped=m["run_skipped"] + skipped,
+            records_salvaged=m["salvaged"] + salvaged,
+            replaced=m["replaced"],
+            post_commit_error=m["warning"] or warning,
+        ))
+    return _group_result(results, warnings)
+
+
+# ---------------------------------------------------------------------------
+# Public consistent group read entry
+# ---------------------------------------------------------------------------
+
+
+def read_log_group(paths, *, quiesce=DEFAULT_QUIESCE):
+    """Return one complete, version-consistent view of a whole log group.
+
+    A list parallel to *paths* is returned, each element that member's
+    decoded records.  Old and new field shapes never mix inside the
+    view -- neither within a member nor between members: while no
+    member's commit marker exists every member is decoded exactly as
+    stored, and as soon as any member's marker exists (the group's
+    commit sequence has begun or finished) every member is normalized
+    to the current version, so a snapshot taken mid-commit or while a
+    writer reopens a path after wrap-up is still uniform.
+
+    Each member's snapshot pins one inode for the whole read, so an
+    atomic replacement mid-read cannot straddle two files, and only
+    newline-terminated lines are included, so a record caught
+    mid-append never appears.  A complete but undecodable line raises
+    ValueError, like :func:`loads`.  A missing or unreadable member
+    raises FileNotFoundError.
+    """
+    paths = _validate_manifest(paths)
+    _require_readable(paths)
+    markers = [_commit_marker_path(p) for p in paths]
+
+    def normalized():
+        views = []
+        for p in paths:
+            with open(p, "rb") as fh:
+                blob = fh.read()
+            views.append([migrate(rec, CURRENT_VERSION)
+                          for rec in _complete_lines(blob)])
+        return views
+
+    # Phase A: no commit marker on any member.  Marker publication
+    # strictly precedes every rename, so the paths still name the
+    # pre-migration inodes; re-check after the reads in case the commit
+    # sequence started meanwhile.
+    if not any(os.path.exists(m) for m in markers):
+        blobs = []
+        for p in paths:
+            with open(p, "rb") as fh:
+                blobs.append(fh.read())
+        if not any(os.path.exists(m) for m in markers):
+            return [_complete_lines(blob) for blob in blobs]
+
+    # Phase B: the commit sequence has begun or finished.  Normalizing
+    # every record makes the view uniform no matter how many member
+    # renames have landed.
+    return normalized()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1038,6 +1804,67 @@ def run_cli(argv):
     )
     if result.post_commit_error:
         # The atomic commit already succeeded: later faults show up as
+        # a warning, never as a non-zero exit.
+        print(f"warning: {result.post_commit_error}", file=sys.stderr)
+    return EXIT_OK
+
+
+def run_group_cli(argv):
+    parser = argparse.ArgumentParser(
+        prog="python3 -m proto_migrate migrate-logs",
+        description="Migrate a whole set of append-only JSONL logs to the "
+        "current record version as one all-or-nothing group: online "
+        "(writers keep appending), resumable from durable checkpoints, "
+        "and atomic across the whole group.",
+    )
+    parser.add_argument("paths", nargs="+", metavar="FILE",
+                        help="log files to migrate in place as one group")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--strict", action="store_const", const="strict",
+                      dest="on_bad", help="abort the whole group on the "
+                      "first bad line (default; exit %d, every file "
+                      "untouched)" % EXIT_BAD_RECORD)
+    mode.add_argument("--skip", action="store_const", const="skip",
+                      dest="on_bad", help="skip bad lines, auditing each "
+                      "to stderr as '<file>:<lineno>:<first 32 bytes>'")
+    parser.set_defaults(on_bad="strict")
+    parser.add_argument("--segment-size", type=int,
+                        default=DEFAULT_SEGMENT_SIZE, metavar="BYTES",
+                        help="rotate temp segments at this size "
+                        "(default: %(default)s)")
+    parser.add_argument("--quiesce-ms", type=float,
+                        default=DEFAULT_QUIESCE * 1000, metavar="MS",
+                        help="EOF must hold this long before the input "
+                        "is considered complete (default: %(default)s)")
+    args = parser.parse_args(argv)
+
+    try:
+        result = migrate_log_group(
+            args.paths,
+            on_bad=args.on_bad,
+            segment_size=args.segment_size,
+            quiesce=args.quiesce_ms / 1000.0,
+        )
+    except BadRecordError as exc:
+        print(f"error: bad record at {exc}", file=sys.stderr)
+        return EXIT_BAD_RECORD
+    except (TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(
+        "migrated=%d skipped=%d salvaged=%d replaced=%d"
+        % (
+            result.records_migrated,
+            result.records_skipped,
+            result.records_salvaged,
+            result.replaced,
+        )
+    )
+    if result.post_commit_error:
+        # The group commit already succeeded: later faults show up as
         # a warning, never as a non-zero exit.
         print(f"warning: {result.post_commit_error}", file=sys.stderr)
     return EXIT_OK

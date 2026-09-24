@@ -28,10 +28,14 @@ __all__ = [
     "loads",
     "migrate",
     "migrate_log_file",
+    "migrate_log_group",
     "read_log",
+    "read_log_group",
     "BadRecordError",
     "MigrationResult",
+    "GroupMigrationResult",
     "run_cli",
+    "run_group_cli",
 ]
 
 VERSIONS = (1, 2, 3)
@@ -162,8 +166,12 @@ def migrate(message, target_version):
 
 from .log_migration import (  # noqa: E402
     BadRecordError,
+    GroupMigrationResult,
     MigrationResult,
     migrate_log_file,
+    migrate_log_group,
     read_log,
+    read_log_group,
     run_cli,
+    run_group_cli,
 )
