@@ -28,6 +28,7 @@ __all__ = [
     "loads",
     "migrate",
     "migrate_log_file",
+    "read_log",
     "BadRecordError",
     "MigrationResult",
     "run_cli",
@@ -163,5 +164,6 @@ from .log_migration import (  # noqa: E402
     BadRecordError,
     MigrationResult,
     migrate_log_file,
+    read_log,
     run_cli,
 )

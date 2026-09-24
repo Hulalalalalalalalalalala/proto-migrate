@@ -1,50 +1,84 @@
-"""Crash-safe batch migration of append-only JSONL log files.
+"""Online, resumable migration of append-only JSONL log files.
 
 Reads a log of mixed-version records (one compact JSON object per line,
-as produced by :func:`proto_migrate.dumps`) in a single streaming pass,
-rewrites every record at the current version, and atomically replaces
-the original file.
+as produced by :func:`proto_migrate.dumps`) that another process may be
+appending to *while the migration runs*, rewrites every record at the
+current version, and atomically replaces the original file.  The writer
+never has to stop or wait for a silent window: concurrently appended
+records are migrated in their original order, with no loss and no
+duplication.
 
-Crash safety: output is written to segmented temporary files next to the
-target, every segment is fsynced, the segments are assembled into one
-final temporary file, that file is fsynced, and only then is it
-atomically renamed over the original (``os.replace``), followed by an
-fsync of the containing directory.  If the process is killed at any
-point, the target path still names either the untouched original bytes
-or the complete migrated file -- never anything in between.  Leftover
-temp files from a killed run are swept on the next run (which holds an
-advisory lock, so a sweep never races a live migrator).
+Online protocol
+---------------
+The migrator tails the live inode.  Each pass consumes whole lines past
+its current offset and only advances once EOF has held for one quiesce
+window, so a partially written (torn) record is never consumed.
 
-Concurrent readers: ``os.replace`` is atomic, so at any instant a reader
-opening the path sees either the whole original file or the whole
-migrated file.  Readers holding an already-open file descriptor keep
-reading the old inode, which is the usual rename semantics.
+  SCAN      output goes to size-bounded segment files in
+            ``<file>.migrate-tmp/``; every completed segment is fsynced
+            and covered by a durable checkpoint recording the consumed
+            input offset, the migrated record count, the skipped count,
+            the cumulative "needs rewrite" flag and the segment size.
+  DRAIN     the quiesced tail is appended, migrated, to the assembled
+            final file.
+  COMMIT    a commit marker (``<file>.committed``, a sibling of the
+            target) is published and fsynced *before* ``os.replace`` so
+            :func:`read_log` never opens the post-rename inode under the
+            pre-commit policy; the rename plus a directory fsync is the
+            single success/failure border -- every later durability or
+            cleanup failure is reported as success.
+  CONVERGE  appenders racing the commit are drained; old-format records
+            a path-reopening writer landed on the new inode are rewritten
+            through further atomic replacements.  It ends only after two
+            consecutive fully empty rounds (final operations are reads,
+            never a rename); a writer appending non-stop past the hard
+            backstop (``max(5 s, quiesce*200)``) is finished by an
+            idempotent rerun instead of waiting forever.
 
-Concurrent appenders: records appended while the migration runs are
-drained into the output (the reader keeps consuming the file until it
-stays at EOF for a quiesce window).  After the atomic rename a bounded
-convergence phase handles two writer shapes: a writer still holding the
-old append descriptor lands records on the unlinked old inode, which is
-drained and appended, migrated, to the new file; a writer opening the
-path by name after the rename may land an old-format record directly on
-the new inode, in which case that tail is rewritten through one more
-atomic replacement.  Either way the path never names a file with mixed
-old/new encodings.  Appenders must write whole records in one
-O_APPEND write.  A writer that appends non-stop past the convergence
-deadline (``quiesce * 20``, at least 1 s) is finished by a plain
-idempotent rerun instead of waiting forever.
+Checkpoints and resume
+----------------------
+A process killed at *any* point reruns and continues from the last
+durable checkpoint: already migrated input is neither rescanned nor
+rewritten, and the result is byte-for-byte identical to one uninterrupted
+run.  Recovery validates the checkpoint log before trusting it:
+
+  * the checkpoint's source-inode header must name the inode the path
+    currently resolves to, and its bad-record policy must match the
+    rerun's (a different inode means an earlier run already committed;
+    a different policy means strict must re-examine lines a skip run
+    passed -- either case restarts as a fresh, idempotent pass);
+  * only newline-terminated records are committed -- a torn half line at
+    the end of the checkpoint log is discarded;
+  * every referenced segment must still exist with at least the recorded
+    number of durable bytes;
+  * offsets and counts must be strictly monotonic.
+
+Anything past the newest valid record is rolled back: the checkpoint
+log is truncated to its good prefix, retained segments are truncated to
+their recorded sizes and unknown segments are deleted, then the input
+range is migrated again.  A corrupt checkpoint file, a missing segment
+or a torn tail therefore falls back to the previous complete checkpoint
+automatically.
 
 Bad records: a line that fails to decode or validate (bad JSON, missing
-or non-integer ``v``, unsupported version, wrong field types, NaN or
-Infinity amounts -- including numeric literals such as ``1e999`` that
-overflow to infinity) is handled according to ``on_bad``: ``"strict"``
-aborts the whole run with :class:`BadRecordError` (a ValueError) and
-leaves the original file untouched; ``"skip"`` skips the line and emits
-an audit entry ``<lineno>:<first 32 raw bytes>`` per skipped line.
+or non-integer ``v``, an unsupported version, wrong field types, or an
+amount that is NaN/Infinity or a literal overflowing to Infinity, e.g.
+``1e999``) is handled per ``on_bad``: ``"strict"`` raises
+:class:`BadRecordError` (a ValueError) at the first bad line and leaves
+the original file untouched; ``"skip"`` skips the line and emits one
+audit entry ``<lineno>:<first 32 raw bytes>`` per skipped line to the
+audit stream (stderr by default).  An amount of ``-0.0`` is preserved
+verbatim.
+
+Concurrent readers use :func:`read_log`, which hands back exactly one
+complete view: either the whole pre-migration content or the whole
+post-migration content (normalized to the current version) -- field
+versions are never mixed inside one view, even while a writer reopens
+the path by name during wrap-up.
 
 Idempotency: if every record is already at the current version in
 canonical encoding and nothing is skipped, the file is left byte-for-byte
-untouched (no rename, no rewrite).
+untouched (no rename, no rewrite, no mtime change).
 """
 
 from __future__ import annotations
@@ -63,6 +97,7 @@ __all__ = [
     "BadRecordError",
     "MigrationResult",
     "migrate_log_file",
+    "read_log",
     "run_cli",
     "EXIT_OK",
     "EXIT_ERROR",
@@ -80,11 +115,29 @@ EXIT_BAD_RECORD = 3
 
 # Testing hook: when this environment variable names a checkpoint, the
 # process kills itself (os._exit, no cleanup) upon reaching it, to
-# simulate a crash mid-migration.  Checkpoints: "lock", "segment",
-# "segments", "assemble", "replace".
+# simulate a crash mid-migration.  Checkpoints: "lock", "marker",
+# "checkpoint" (alias "segment"), "segments", "assemble", "drain",
+# "replace", "dirfsync", "committed", "converge", "cleanup".
 _CRASH_ENV = "PROTO_MIGRATE_CRASH_AT"
+# Testing hook: when this names a post-commit step ("dirfsync" or
+# "cleanup"), that step raises OSError instead of running, so tests can
+# prove a durability/cleanup failure after the atomic rename is reported
+# as a successful migration (exit 0).
+_FAULT_ENV = "PROTO_MIGRATE_FAULT_AT"
 
 _AUDIT_SNIPPET = 32
+_CP_NAME = "checkpoint"
+
+
+def _commit_marker_path(path):
+    """Sibling marker naming the most recent committed migration.
+
+    Unlike the work directory this marker is kept after a successful
+    run, so :func:`read_log` keeps serving normalized (uniform) views
+    even when a writer reopens the path and appends old-format records
+    after wrap-up; a plain rerun then migrates those bytes.
+    """
+    return path + ".committed"
 
 
 def _crash_point(point):
@@ -108,6 +161,7 @@ class MigrationResult(NamedTuple):
     records_skipped: int
     records_salvaged: int
     replaced: bool
+    post_commit_error: str | None = None
 
 
 def _fsync_dir(dirpath):
@@ -118,22 +172,43 @@ def _fsync_dir(dirpath):
         os.close(fd)
 
 
-def _read_lines(f, quiesce, offset=0, deadline=None):
+def _read_lines(f, quiesce, offset=0, deadline=None, follow=None):
     """Yield raw lines from *f* starting at *offset*, following appends.
 
-    Stops once the file has stayed at EOF for one quiesce window (or
-    once *deadline*, a time.monotonic() instant, is exceeded).  A final
-    line without a trailing newline is yielded once it is stable.
+    Stopping rules:
+      * once EOF has held for one quiesce window, the generator returns
+        (a final line without a trailing newline is yielded once
+        stable);
+      * *deadline*, an absolute ``time.monotonic()`` instant, always
+        bounds the generator;
+      * *follow*, a duration in seconds, bounds only the append-following
+        tail: it is armed on the *first* encounter with EOF, so an
+        arbitrarily large pre-existing body is consumed in full even
+        when records keep arriving, while a writer that never pauses
+        still cannot stall the run forever.  Records appended after the
+        window ends are handled by the drain/convergence phases (or by
+        an idempotent rerun) and are never lost.
     """
+    follow_deadline = None
     while True:
         f.seek(offset)
         line = f.readline()
         if line.endswith(b"\n"):
             offset += len(line)
             yield line
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                return
+            if follow_deadline is not None and now >= follow_deadline:
+                return
             continue
+        # Short read: at EOF or on a record still being appended.
+        if follow_deadline is None and follow is not None:
+            follow_deadline = time.monotonic() + follow
         size = os.fstat(f.fileno()).st_size
         if deadline is not None and time.monotonic() >= deadline:
+            return
+        if follow_deadline is not None and time.monotonic() >= follow_deadline:
             return
         if size > offset + len(line):
             continue  # grew underneath us; re-read from the same offset
@@ -157,69 +232,6 @@ def _audit_line(lineno, raw):
     return str(lineno).encode("ascii") + b":" + line[:_AUDIT_SNIPPET] + b"\n"
 
 
-class _SegmentWriter:
-    """Writes output records into size-bounded fsynced segment files."""
-
-    def __init__(self, tmp_dir, max_bytes):
-        self._tmp_dir = tmp_dir
-        self._max = max(1, max_bytes)
-        self._fh = None
-        self._size = 0
-        self.segments = []
-
-    def write(self, data):
-        if self._fh is not None and self._size >= self._max:
-            self._close_segment()
-        if self._fh is None:
-            name = f"seg-{len(self.segments):06d}"
-            self._fh = open(os.path.join(self._tmp_dir, name), "wb")
-            self._size = 0
-            self.segments.append(name)
-        self._fh.write(data)
-        self._size += len(data)
-
-    def _close_segment(self):
-        if self._fh is None:
-            return
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
-        self._fh.close()
-        self._fh = None
-        _crash_point("segment")
-
-    def close(self):
-        self._close_segment()
-
-    def abort(self):
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = None
-
-
-def _assemble(tmp_dir, segments):
-    """Concatenate segments into the final temp file and fsync it."""
-    final = os.path.join(tmp_dir, "final")
-    if len(segments) == 1:
-        os.rename(os.path.join(tmp_dir, segments[0]), final)
-    else:
-        with open(final, "wb") as out:
-            for name in segments:
-                with open(os.path.join(tmp_dir, name), "rb") as part:
-                    shutil.copyfileobj(part, out)
-            out.flush()
-            os.fsync(out.fileno())
-        for name in segments:
-            os.remove(os.path.join(tmp_dir, name))
-    # The single-segment rename inherits that segment's fsync; fsync
-    # again unconditionally so "final" is durable either way.
-    fd = os.open(final, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    return final
-
-
 def _emit(audit_stream, on_bad, raw, lineno):
     """Convert one line; return (output bytes or None, was_bad)."""
     try:
@@ -233,15 +245,490 @@ def _emit(audit_stream, on_bad, raw, lineno):
     return out, False
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint log
+# ---------------------------------------------------------------------------
+#
+# First line:  "src <inode> <mode>\n" -- the inode the scan was started
+# against and the bad-record policy of the run ("strict"/"skip"); a
+# rerun with a different policy starts over so strict cannot inherit a
+# skip run's silently passed bad lines.
+# Each following line records one durable output prefix:
+#   "<input-offset> <good-count> <skipped-count> <dirty> <seg> <size>\n"
+# dirty is cumulative (1 as soon as any record was re-encoded or any bad
+# line skipped); <seg> is the segment holding the newest output bytes and
+# <size> its durable length.  Records are trusted only when
+# newline-terminated, strictly monotonic, and backed by an existing
+# segment of at least <size> bytes.
+
+
+def _parse_cp_record(text):
+    parts = text.split(" ")
+    if len(parts) != 6:
+        raise ValueError("malformed checkpoint record")
+    off_s, count_s, skip_s, dirty_s, name, size_s = parts
+    if not (off_s.isdigit() and count_s.isdigit()
+            and skip_s.isdigit() and size_s.isdigit()):
+        raise ValueError("malformed checkpoint numbers")
+    if dirty_s not in ("0", "1"):
+        raise ValueError("malformed checkpoint dirty flag")
+    if not name.startswith("seg-") or "/" in name:
+        raise ValueError("malformed checkpoint segment name")
+    try:
+        int(name[4:])
+    except ValueError:
+        raise ValueError("malformed checkpoint segment name") from None
+    return (int(off_s), int(count_s), int(skip_s), int(dirty_s),
+            name, int(size_s))
+
+
+def _read_checkpoint_log(tmp_dir):
+    """Return ``(src_inode, mode, records, good_byte_prefix)``.
+
+    Parsing stops at the first torn/garbled line or any record whose
+    segment is missing or shorter than recorded; everything before it
+    remains the valid prefix the caller rolls back to.
+    """
+    path = os.path.join(tmp_dir, _CP_NAME)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return None, None, [], b""
+    inode = None
+    mode = None
+    records = []
+    good = b""
+    header_seen = False
+    for line in data.splitlines(keepends=True):
+        if not line.endswith(b"\n"):
+            break  # torn checkpoint append: roll back
+        body = line[:-1].decode("ascii", errors="strict")
+        if not header_seen:
+            if not body.startswith("src "):
+                break
+            parts = body[4:].split(" ")
+            if len(parts) != 2 or not parts[0].isdigit() \
+                    or parts[1] not in ("strict", "skip"):
+                break
+            inode = int(parts[0])
+            mode = parts[1]
+            header_seen = True
+            good += line
+            continue
+        try:
+            rec = _parse_cp_record(body)
+        except (ValueError, UnicodeDecodeError):
+            break
+        off, count, skipped, _dirty, name, size = rec
+        if records:
+            prev = records[-1]
+            if off <= prev[0] or count < prev[1] or skipped < prev[2]:
+                break
+        seg_path = os.path.join(tmp_dir, name)
+        try:
+            st = os.stat(seg_path)
+        except OSError:
+            break  # missing segment: roll back to previous checkpoint
+        if size <= 0 or st.st_size < size or not os.path.isfile(seg_path):
+            break
+        records.append(rec)
+        good += line
+    return inode, mode, records, good
+
+
+def _append_checkpoint(cp_fh, tmp_dir, line):
+    cp_fh.seek(0, os.SEEK_END)
+    cp_fh.write(line)
+    cp_fh.flush()
+    os.fsync(cp_fh.fileno())
+    # Make the new segment's directory entry and the checkpoint bytes
+    # durable before this record may be trusted on recovery.
+    _fsync_dir(tmp_dir)
+    _crash_point("checkpoint")
+    _crash_point("segment")  # backwards-compatible crash point name
+
+
+def _publish_prefix_checkpoint(cp_fh, tmp_dir, offset, count, skipped,
+                               dirty, seg_name, seg_size):
+    line = (f"{offset} {count} {skipped} {1 if dirty else 0} "
+            f"{seg_name} {seg_size}\n").encode("ascii")
+    _append_checkpoint(cp_fh, tmp_dir, line)
+
+
+class _SegmentWriter:
+    """Size-bounded segment writer; a segment is created on first write."""
+
+    def __init__(self, tmp_dir, max_bytes, start_index):
+        self._tmp_dir = tmp_dir
+        self._max = max(1, max_bytes)
+        self._index = start_index
+        self._fh = None
+        self._size = 0
+        self.segments = []
+
+    @property
+    def size(self):
+        return self._size
+
+    @property
+    def limit(self):
+        return self._max
+
+    @property
+    def current_segment(self):
+        return self.segments[-1] if self.segments else None
+
+    @property
+    def has_open_segment(self):
+        return self._fh is not None
+
+    def write(self, data):
+        if self._fh is None:
+            name = f"seg-{self._index:06d}"
+            self._fh = open(os.path.join(self._tmp_dir, name), "wb")
+            self._size = 0
+            self.segments.append(name)
+            self._index += 1
+        self._fh.write(data)
+        self._size += len(data)
+
+    def fsync_open(self):
+        if self._fh is not None:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+
+    def close(self):
+        """Seal the open segment (fsync); the driver checkpoints it."""
+        if self._fh is not None:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._fh.close()
+            self._fh = None
+
+    def abort(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _assemble(tmp_dir, segments, into):
+    """Concatenate segments into *into* (fsynced); keep the segments."""
+    if os.path.exists(into):
+        os.remove(into)
+    with open(into, "wb") as out:
+        for name in segments:
+            with open(os.path.join(tmp_dir, name), "rb") as part:
+                shutil.copyfileobj(part, out)
+        out.flush()
+        os.fsync(out.fileno())
+    fd = os.open(into, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return into
+
+
+def _segment_names(tmp_dir):
+    return sorted(
+        n for n in os.listdir(tmp_dir)
+        if n.startswith("seg-")
+        and os.path.isfile(os.path.join(tmp_dir, n))
+    )
+
+
+def _wipe_workdir(tmp_dir):
+    for name in os.listdir(tmp_dir):
+        p = os.path.join(tmp_dir, name)
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+
+
+def _prepare_workdir(path, tmp_dir, segment_size, current_inode, on_bad):
+    """Create/open the work directory and recover the last checkpoint.
+
+    Returns a dict with the resume state.  The scan checkpoint is
+    resumed exactly when it was taken against the inode the path still
+    names *and* under the same bad-record policy.  A changed inode means
+    an earlier run already committed; a changed policy means a strict
+    run must re-examine lines the earlier skip run passed -- either way
+    the run starts as a fresh pass.
+    """
+    os.makedirs(tmp_dir, exist_ok=True)
+    cp_path = os.path.join(tmp_dir, _CP_NAME)
+    inode, mode, records, good = _read_checkpoint_log(tmp_dir)
+
+    if records and inode == current_inode and mode == on_bad:
+        keep = {name: size for off, count, skipped, dirty, name, size
+                in records}
+        on_disk = set(_segment_names(tmp_dir))
+        # Segments beyond the validated prefix belong to an interrupted
+        # run: delete them so their input range is redone.
+        for name in on_disk - keep.keys():
+            os.remove(os.path.join(tmp_dir, name))
+        # Wipe bytes a killed run flushed into a retained segment past
+        # its last durable checkpoint.
+        for name, size in keep.items():
+            seg_path = os.path.join(tmp_dir, name)
+            if os.path.getsize(seg_path) != size:
+                with open(seg_path, "r+b") as f:
+                    f.truncate(size)
+        # Rewrite the checkpoint log to exactly its good prefix.
+        with open(cp_path, "r+b") as cp_fh:
+            cp_fh.seek(0)
+            if cp_fh.read() != good:
+                cp_fh.seek(0)
+                cp_fh.truncate()
+                cp_fh.write(good)
+                cp_fh.flush()
+                os.fsync(cp_fh.fileno())
+                _fsync_dir(tmp_dir)
+        offset, count, skipped, dirty, _last_seg, _size = records[-1]
+        next_index = max(int(n[4:]) for n in keep) + 1
+        return {
+            "offset": offset,
+            "count": count,
+            "skipped": skipped,
+            "dirty": bool(dirty),
+            "writer": _SegmentWriter(tmp_dir, segment_size, next_index),
+            "cp_fh": open(cp_path, "ab"),
+            "resumed": True,
+        }
+
+    # Fresh start.  The target is intact or already committed; the lock
+    # guarantees no live migrator's artifacts are being swept.
+    _wipe_workdir(tmp_dir)
+    cp_fh = open(cp_path, "ab")
+    cp_fh.write(f"src {current_inode} {on_bad}\n".encode("ascii"))
+    cp_fh.flush()
+    os.fsync(cp_fh.fileno())
+    _fsync_dir(tmp_dir)
+    return {
+        "offset": 0,
+        "count": 0,
+        "skipped": 0,
+        "dirty": False,
+        "segments": [],
+        "writer": _SegmentWriter(tmp_dir, segment_size, 0),
+        "cp_fh": cp_fh,
+        "resumed": False,
+    }
+
+
+def _available_lines(fd, off):
+    """Read every complete line available on *fd* right now, no sleep.
+
+    Returns ``(lines, new_off)``.  A short read at EOF (a record still
+    being appended, or simply EOF) ends the batch; the caller performs a
+    shared quiesce wait and probes again.
+    """
+    lines = []
+    fd.seek(off)
+    while True:
+        line = fd.readline()
+        if not line or not line.endswith(b"\n"):
+            break
+        off += len(line)
+        lines.append(line)
+    return lines, off
+
+
+def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
+              audit_stream, on_bad):
+    """Drain appenders across the commit.
+
+    Returns ``(salvaged, skipped, lineno, warning)``.  A repair I/O
+    failure after the commit is reported as a warning, never a failure
+    of the already-committed migration.
+
+    Ordering model: every inode created by one of our renames is one
+    *generation*.  A whole-record write lands on the inode the writer's
+    ``open`` resolved to, so a record on an older-generation inode was
+    opened before the rename that unlinked it and globally precedes
+    every record on a younger inode -- including a record that lands on
+    the older inode *late*, because the writer was preempted between
+    ``open`` and its single ``write``.
+
+    The post-commit file is split into an immutable ``base`` (the bytes
+    present at convergence entry, always re-copied verbatim) plus one
+    ordered migrated byte buffer per generation.  Each repair rebuilds
+    ``base + gen[0] + gen[1] + ... + current tail`` in one atomic
+    replacement, so a late straddle write drained into an older
+    generation's buffer on the next round moves back to its true
+    position instead of trailing already-promised records.
+
+    Each round drains all stale inodes and the live current tail,
+    sleeps once for the quiesce window, and probes again (that second
+    probe catches a write whose open straddled a rename).  Convergence
+    exits only after TWO consecutive rounds with no bytes anywhere --
+    and the final operations are always reads, never a rename, so an
+    inode cannot be unlinked while a straddle write is still in flight.
+    A non-stop writer is bounded by a hard backstop; path-reopening
+    appends after that are migrated by an idempotent rerun.
+    """
+    warning = None
+    start = time.monotonic()
+    # Convergence normally ends after two consecutive fully empty
+    # rounds.  The hard backstop only bounds a writer that appends
+    # non-stop for seconds; on hitting it the run stops issuing new
+    # renames (never renaming after its final read, so it never unlinks
+    # an inode with a straddle write in flight) and reports a warning --
+    # path-reopening appends after that are migrated by a rerun.
+    hard_deadline = start + max(5.0, quiesce * 200)
+
+    base_size = os.path.getsize(path)
+    tail_tmp = os.path.join(tmp_dir, "tail-final")
+
+    # One entry per unlinked generation still tracked:
+    # [fd, consumed-offset-in-that-inode, migrated-byte-buffer].
+    # The source inode is generation 0; its consumed offset is the
+    # drain offset handed over from the commit phase, and its buffer
+    # starts empty (the records drained before the commit are already
+    # in the immutable base).
+    gens = [[src, offset, bytearray()]]
+    extra_fds = []
+    # Physical size of the rebuilt suffix at the time of the most recent
+    # replacement -- exactly where live appends on the current inode
+    # begin.  This must not use the (meanwhile grown) buffers, whose new
+    # straddle bytes live on stale inodes, not in the current file.
+    suffix_size = 0
+    salvaged_records = 0
+    lineno_box = [lineno]
+    skipped_box = [0]
+
+    def convert_into(buf, raw):
+        nonlocal salvaged_records
+        out, bad = _emit(audit_stream, on_bad, raw, lineno_box[0])
+        lineno_box[0] += 1
+        if bad:
+            skipped_box[0] += 1
+            return False
+        buf.extend(out)
+        salvaged_records += 1
+        return True
+
+    def do_rebuild(cur_tail):
+        """Atomically publish base + all gen buffers + *cur_tail*."""
+        rebuilt = base_size
+        with open(tail_tmp, "wb") as out_fh:
+            with open(path, "rb") as prefix:
+                remaining = base_size
+                while remaining:
+                    chunk = prefix.read(min(1024 * 1024, remaining))
+                    out_fh.write(chunk)
+                    remaining -= len(chunk)
+            for entry in gens:
+                out_fh.write(entry[2])
+                rebuilt += len(entry[2])
+            out_fh.write(cur_tail)
+            rebuilt += len(cur_tail)
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+        os.replace(tail_tmp, path)
+        _fsync_dir(parent)
+        return rebuilt - base_size
+
+    empty_rounds = 0
+    try:
+        while True:
+            if time.monotonic() >= hard_deadline:
+                warning = (
+                    "writer still appending at convergence backstop; "
+                    "committed all records drained so far, rerun to catch "
+                    "up later appends"
+                )
+                break
+
+            # 1) First probes of every stale inode and the live tail.
+            moved = 0
+            staged = []  # (gen-entry, first-lines)
+            for entry in gens:
+                lines, new_off = _available_lines(entry[0], entry[1])
+                staged.append((entry, lines, new_off))
+            cur = open(path, "rb")
+            cur_first, cur_off_after = _available_lines(
+                cur, base_size + suffix_size
+            )
+
+            # 2) A single shared quiesce wait for all fds, then second
+            #    probes that catch an open->write straddle.
+            time.sleep(quiesce)
+            cur_bytes = 0
+            for entry, lines, new_off in staged:
+                for raw in lines:
+                    if convert_into(entry[2], raw):
+                        moved += 1
+                more, new_off2 = _available_lines(entry[0], new_off)
+                entry[1] = new_off2
+                for raw in more:
+                    if convert_into(entry[2], raw):
+                        moved += 1
+            cur_tail = bytearray()
+            for raw in cur_first:
+                if convert_into(cur_tail, raw):
+                    cur_bytes += 1
+            cur_second, cur_off_final = _available_lines(
+                cur, cur_off_after
+            )
+            for raw in cur_second:
+                if convert_into(cur_tail, raw):
+                    cur_bytes += 1
+
+            if moved == 0 and cur_bytes == 0:
+                cur.close()
+                empty_rounds += 1
+                if empty_rounds >= 2:
+                    break
+                continue
+            empty_rounds = 0
+
+            # 3) Rebuild and promote; the old current inode becomes the
+            #    next stale generation (its consumed offset already
+            #    skips the folded tail).
+            try:
+                suffix_size = do_rebuild(cur_tail)
+            except OSError as exc:
+                cur.close()
+                warning = (
+                    "post-commit convergence incomplete, rerun to finish: "
+                    f"{exc}"
+                )
+                break
+            gens.append([cur, cur_off_final, bytearray(cur_tail)])
+            extra_fds.append(cur)
+    finally:
+        for fd in extra_fds:
+            try:
+                fd.close()
+            except OSError:
+                pass
+
+    return salvaged_records, skipped_box[0], lineno_box[0], warning
+
+
 def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE,
                      quiesce=DEFAULT_QUIESCE, audit=None):
     """Migrate a JSONL log file in place to the current record version.
 
-    Returns a MigrationResult.  In strict mode raises BadRecordError (a
-    ValueError) on the first bad line, leaving the file untouched.
+    The file may be appended to while this runs; appended records are
+    migrated in order, without loss or duplication.  A killed run
+    resumes from its last durable checkpoint and finishes byte-identical
+    to an uninterrupted run.
+
+    Returns a :class:`MigrationResult`.  In strict mode raises
+    :class:`BadRecordError` on the first bad line and leaves the target
+    file (and its source bytes) untouched.
     """
     if on_bad not in ("strict", "skip"):
         raise ValueError(f"on_bad must be 'strict' or 'skip', got {on_bad!r}")
+    if segment_size <= 0:
+        raise ValueError("segment_size must be positive")
     path = os.fspath(path)
     parent = os.path.dirname(os.path.abspath(path))
     lock_path = path + ".migrate.lock"
@@ -250,51 +737,78 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
 
     migrated = skipped = salvaged = 0
     replaced = False
+    post_commit_error = None
 
     with open(lock_path, "a+b") as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         try:
             _crash_point("lock")
-            # With the lock held, any leftover tmp dir belongs to a
-            # killed run; the target is still intact, so sweep it.
-            if os.path.isdir(tmp_dir):
-                shutil.rmtree(tmp_dir)
-            os.mkdir(tmp_dir)
-            writer = _SegmentWriter(tmp_dir, segment_size)
-            dirty = False
-            lineno = 0
-            offset = 0
+            # A marker.tmp left by a crash between its creation and the
+            # atomic rename is stale and would otherwise linger.
+            try:
+                os.unlink(_commit_marker_path(path) + ".tmp")
+            except FileNotFoundError:
+                pass
+            state = _prepare_workdir(
+                path, tmp_dir, segment_size, os.stat(path).st_ino, on_bad
+            )
+            writer: _SegmentWriter = state["writer"]
+            cp_fh = state["cp_fh"]
+            offset = state["offset"]
+            migrated = state["count"]
+            skipped = state["skipped"]
+            dirty = state["dirty"]
+            lineno = state["count"] + state["skipped"]
             try:
                 with open(path, "rb") as src:
-                    # Main pass, then extra drain rounds: each round
-                    # consumes records appended since the previous one
-                    # and stops once the file holds at EOF for a
-                    # quiesce window.  A round that finds nothing new
-                    # means appenders are quiescent -> proceed.
-                    while True:
-                        extra = 0
-                        for raw in _read_lines(src, quiesce, offset=offset):
-                            lineno += 1
-                            offset += len(raw)
-                            out, bad = _emit(audit_stream, on_bad, raw, lineno)
-                            if bad:
-                                skipped += 1
-                                dirty = True
-                                continue
-                            if raw != out:
-                                dirty = True
-                            writer.write(out)
-                            migrated += 1
-                            extra += 1
-                        if not extra:
-                            break
+                    # --- SCAN: tail the live inode.  The pre-existing
+                    # body is always consumed in full; the follow
+                    # window (armed at the first EOF) bounds how long
+                    # the scan keeps tailing a still-active appender so
+                    # the run never waits for a silent window, and a
+                    # writer that appends non-stop cannot stall it.
+                    follow_window = max(1.0, quiesce * 20)
+                    for raw in _read_lines(src, quiesce, offset=offset,
+                                           follow=follow_window):
+                        lineno += 1
+                        offset += len(raw)
+                        out, bad = _emit(audit_stream, on_bad, raw, lineno)
+                        if bad:
+                            skipped += 1
+                            dirty = True
+                            continue
+                        if raw != out:
+                            dirty = True
+                        writer.write(out)
+                        migrated += 1
+                        if writer.size >= writer.limit:
+                            name = writer.current_segment
+                            writer.close()
+                            _publish_prefix_checkpoint(
+                                cp_fh, tmp_dir, offset, migrated,
+                                skipped, dirty, name,
+                                os.path.getsize(
+                                    os.path.join(tmp_dir, name)),
+                            )
 
-                    writer.close()
+                    if writer.has_open_segment:
+                        # The last segment never hit the rotation limit;
+                        # cover it once so a crash during assemble/drain
+                        # rescans nothing.  A segment sealed at rotation
+                        # already has its checkpoint and must not get a
+                        # duplicate (same-offset) record.
+                        name = writer.current_segment
+                        writer.close()
+                        _publish_prefix_checkpoint(
+                            cp_fh, tmp_dir, offset, migrated, skipped,
+                            dirty, name,
+                            os.path.getsize(os.path.join(tmp_dir, name)),
+                        )
                     _crash_point("segments")
 
                     if not dirty:
-                        # Already current-version, canonical and clean:
-                        # leave every byte of the original in place.
+                        # Canonical current-version file, nothing
+                        # skipped: leave every byte untouched.
                         return MigrationResult(
                             path=path,
                             records_migrated=migrated,
@@ -303,15 +817,21 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
                             replaced=False,
                         )
 
-                    final = _assemble(tmp_dir, writer.segments)
+                    final = _assemble(
+                        tmp_dir, _segment_names(tmp_dir),
+                        os.path.join(tmp_dir, "final"),
+                    )
                     _crash_point("assemble")
 
-                    # Final drain immediately before the rename.  New
-                    # records are appended, migrated, to "final", so
-                    # old and new encodings are never interleaved.
-                    tail_added = 0
+                    # --- DRAIN: migrate everything appended since the
+                    # scan ended straight onto "final", bounded by the
+                    # same follow window so a non-stop appender defers
+                    # its remainder to convergence / a rerun instead of
+                    # blocking the commit.
                     with open(final, "ab") as out_fh:
-                        for raw in _read_lines(src, quiesce, offset=offset):
+                        tail_added = 0
+                        for raw in _read_lines(src, quiesce, offset=offset,
+                                               follow=follow_window):
                             lineno += 1
                             offset += len(raw)
                             out, bad = _emit(audit_stream, on_bad, raw, lineno)
@@ -324,138 +844,69 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
                         if tail_added:
                             out_fh.flush()
                             os.fsync(out_fh.fileno())
+                    _crash_point("drain")
+
+                    # --- COMMIT: the single success/failure border -----
+                    # Publish the commit marker *before* the rename and
+                    # fsync it durably: once it exists read_log serves
+                    # only normalized post-commit views, so it can never
+                    # open the post-rename inode under the pre-commit
+                    # policy.  A crash here leaves marker + original
+                    # file behind; the rerun resumes the checkpoint
+                    # (same source inode) and finishes.
+                    marker = _commit_marker_path(path)
+                    marker_tmp = marker + ".tmp"
+                    with open(marker_tmp, "wb") as mf:
+                        mf.write(b"1\n")
+                        mf.flush()
+                        os.fsync(mf.fileno())
+                    os.replace(marker_tmp, marker)
+                    _fsync_dir(parent)
+                    _crash_point("marker")
 
                     os.replace(final, path)
-                    _fsync_dir(parent)
-                    replaced = True
                     _crash_point("replace")
-
-                    # Converge with racing appenders.  After the rename
-                    # there are two kinds of inode a writer may land on:
-                    #   * stale inodes unlinked by our renames -- writers
-                    #     that held an append descriptor keep writing
-                    #     there, and we keep each one open to drain it;
-                    #   * the current inode -- writers opening by path
-                    #     land here, possibly still in an old format.
-                    # Each round drains every stale inode, reads the
-                    # current inode's tail past the migrated prefix, and
-                    # does one more atomic replacement with all tails
-                    # migrated.  Iteration ends when a round finds no
-                    # new bytes; a deadline bounds a writer that appends
-                    # nonstop.  At every instant the path names either a
-                    # fully old or fully new file, never a mix.
-                    deadline = time.monotonic() + max(1.0, quiesce * 20)
-                    # Inodes unlinked by our renames that a racing writer
-                    # may still hold an append descriptor to:
-                    # [fd, consumed offset].  src (the original inode)
-                    # is also closed by the enclosing with-block, so it
-                    # is not added to extra_fds.
-                    stale = [[src, offset]]
-                    extra_fds = []
-                    prefix_size = os.path.getsize(path)
-                    tail_tmp = os.path.join(tmp_dir, "tail-final")
                     try:
-                        while time.monotonic() < deadline:
-                            tails = []
-                            for entry in stale:
-                                fd, off = entry[0], entry[1]
-                                pending = []
-                                for raw in _read_lines(
-                                    fd, quiesce, offset=off, deadline=deadline
-                                ):
-                                    lineno += 1
-                                    out, bad = _emit(
-                                        audit_stream, on_bad, raw, lineno
-                                    )
-                                    if bad:
-                                        skipped += 1
-                                    else:
-                                        pending.append(out)
-                                        salvaged += 1
-                                    off += len(raw)
-                                entry[1] = off
-                                tails.append(b"".join(pending))
+                        if os.environ.get(_FAULT_ENV) == "dirfsync":
+                            raise OSError("injected directory fsync fault")
+                        _fsync_dir(parent)
+                    except OSError as exc:
+                        post_commit_error = f"directory fsync failed: {exc}"
+                    _crash_point("dirfsync")
+                    replaced = True
+                    _crash_point("committed")
 
-                            # Records a writer appended straight onto the
-                            # current inode (it opened the path after our
-                            # rename).  A non-canonical line there makes the
-                            # file mixed; repair it with another atomic
-                            # replacement.
-                            cur = open(path, "rb")
-                            cur_entries = []
-                            cur_tail_bytes = 0
-                            for raw in _read_lines(
-                                cur, quiesce, offset=prefix_size,
-                                deadline=deadline,
-                            ):
-                                lineno += 1
-                                out, bad = _emit(
-                                    audit_stream, on_bad, raw, lineno
-                                )
-                                if bad:
-                                    skipped += 1
-                                cur_entries.append((raw, out, bad))
-                                cur_tail_bytes += len(raw)
-
-                            if not any(tails) and not cur_entries:
-                                # Every inode stayed at EOF for a full
-                                # quiesce window: writers have converged.
-                                cur.close()
-                                break
-
-                            mixed = any(
-                                not bad and raw != out
-                                for raw, out, bad in cur_entries
-                            )
-                            if mixed:
-                                # Stable migrated prefix [0, prefix_size),
-                                # then the migrated current-inode tail, then
-                                # migrated stale-inode tails -- one atomic
-                                # swap.  cur becomes a stale inode next round.
-                                with open(tail_tmp, "wb") as out_fh:
-                                    with open(path, "rb") as prefix:
-                                        remaining = prefix_size
-                                        while remaining:
-                                            chunk = prefix.read(
-                                                min(1024 * 1024, remaining)
-                                            )
-                                            out_fh.write(chunk)
-                                            remaining -= len(chunk)
-                                    for raw, out, bad in cur_entries:
-                                        if not bad:
-                                            out_fh.write(out)
-                                    out_fh.write(b"".join(tails))
-                                    out_fh.flush()
-                                    os.fsync(out_fh.fileno())
-                                consumed = prefix_size + cur_tail_bytes
-                                prefix_size = os.path.getsize(tail_tmp)
-                                os.replace(tail_tmp, path)
-                                _fsync_dir(parent)
-                                stale.append([cur, consumed])
-                                extra_fds.append(cur)
-                            else:
-                                # Current-inode tail is already canonical;
-                                # just append the migrated stale-inode tails.
-                                cur.close()
-                                prefix_size += cur_tail_bytes
-                                extra = b"".join(tails)
-                                if extra:
-                                    with open(path, "ab") as tail:
-                                        tail.write(extra)
-                                        tail.flush()
-                                        os.fsync(tail.fileno())
-                                    prefix_size += len(extra)
-                    finally:
-                        for fd in extra_fds:
-                            fd.close()
+                    # --- CONVERGE with racing appenders ----------------
+                    salvaged, conv_skipped, lineno, warning = _converge(
+                        path, parent, tmp_dir, src, offset, lineno,
+                        quiesce, audit_stream, on_bad,
+                    )
+                    skipped += conv_skipped
+                    if warning and post_commit_error is None:
+                        post_commit_error = warning
+                    _crash_point("converge")
             except BaseException:
                 writer.abort()
                 raise
             finally:
-                # On success the tmp dir is empty; on a strict abort it
-                # holds partial segments.  Either way the target is
-                # intact or fully replaced, so removal is safe.
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                writer.abort()
+                try:
+                    cp_fh.close()
+                finally:
+                    if replaced:
+                        # Commit landed: cleanup faults are warnings.
+                        try:
+                            _crash_point("cleanup")
+                            if os.environ.get(_FAULT_ENV) == "cleanup":
+                                raise OSError("injected cleanup fault")
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                        except OSError as exc:
+                            if post_commit_error is None:
+                                post_commit_error = f"cleanup failed: {exc}"
+                    else:
+                        # Target untouched (strict abort or clean file):
+                        # sweep partial work, as in the batch design.
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
         finally:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
@@ -465,14 +916,81 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
         records_skipped=skipped,
         records_salvaged=salvaged,
         replaced=replaced,
+        post_commit_error=post_commit_error,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public consistent read entry
+# ---------------------------------------------------------------------------
+
+
+def _complete_lines(blob):
+    """Decode every newline-terminated line; a torn tail is excluded."""
+    parts = blob.split(b"\n")
+    # The final element follows the last newline: it is empty when the
+    # blob ends with "\n", otherwise a record still being appended --
+    # either way not part of the view.  Every other element is a
+    # complete stored line and must decode like a normal record.
+    return [loads(line + b"\n") for line in parts[:-1]]
+
+
+def read_log(path, *, quiesce=DEFAULT_QUIESCE):
+    """Return one complete, version-consistent view of a migrating log.
+
+    A list of decoded record dicts is returned.  While a migration runs
+    the caller receives either the full pre-migration content (records
+    decoded exactly as stored) or the full post-migration content
+    (every record normalized to the current version); the two field
+    shapes never mix inside one view -- including while a writer
+    reopens the path by name and appends during the migrator's wrap-up.
+
+    The view is an instant, coherent snapshot: the open descriptor pins
+    a single inode for the whole read, so an atomic replacement mid-read
+    cannot straddle two files, and only newline-terminated lines are
+    included, so a record caught mid-append never appears.  A complete
+    but undecodable line raises ValueError, like :func:`loads`.
+
+    The *quiesce* argument is accepted for API symmetry with
+    :func:`migrate_log_file`; an instant snapshot never blocks on an
+    active appender.
+    """
+    path = os.fspath(path)
+    marker = _commit_marker_path(path)
+
+    # Phase A: no commit marker yet.  Marker publication strictly
+    # precedes the rename, so a missing marker means the path still
+    # names the pre-migration inode; a descriptor opened here pins it
+    # for the whole read even if the rename happens concurrently.
+    if not os.path.exists(marker):
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        if not os.path.exists(marker):
+            return _complete_lines(blob)
+        # The commit landed while we read: serve the post view instead.
+
+    # Phase B: post-commit.  The descriptor pins one inode for the whole
+    # snapshot, and normalizing every record makes the view uniform even
+    # if that inode transiently holds a migrated prefix plus an
+    # old-format tail (convergence rewrites that tail atomically; a
+    # path-reopening appender after wrap-up is cleaned by the next
+    # idempotent run).
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    return [migrate(rec, CURRENT_VERSION) for rec in _complete_lines(blob)]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def run_cli(argv):
     parser = argparse.ArgumentParser(
         prog="python3 -m proto_migrate migrate-log",
         description="Migrate an append-only JSONL log to the current "
-        "record version, crash-safe and atomically.",
+        "record version: online (writers keep appending), resumable "
+        "from durable checkpoints, and atomic.",
     )
     parser.add_argument("path", help="log file to migrate in place")
     mode = parser.add_mutually_exclusive_group()
@@ -518,4 +1036,8 @@ def run_cli(argv):
             "yes" if result.replaced else "no",
         )
     )
+    if result.post_commit_error:
+        # The atomic commit already succeeded: later faults show up as
+        # a warning, never as a non-zero exit.
+        print(f"warning: {result.post_commit_error}", file=sys.stderr)
     return EXIT_OK
