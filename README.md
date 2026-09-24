@@ -136,6 +136,128 @@ untouched (no rename, no mtime change). A second run rewrites no bytes,
 and a run that recovered from a crash finishes byte-identical to a run
 that was never interrupted.
 
+## Group migration: `migrate-logs`
+
+`migrate-logs` migrates a whole **group** of log files in one shot.
+The group is indivisible: either every member ends up at the current
+version or every member stays exactly as it was — no partially
+migrated group is ever left behind after a handled failure or a kill.
+The member list is always given explicitly, and each member may be
+appended to by a *different* process while the migration runs:
+
+    python3 -m proto_migrate migrate-logs a.log b.log c.log          # strict
+    python3 -m proto_migrate migrate-logs a.log b.log c.log --skip
+
+Python entry points:
+
+```python
+from proto_migrate import migrate_log_group, read_log_group
+
+result = migrate_log_group(["a.log", "b.log"], on_bad="strict")  # or "skip"
+# result.records_migrated / records_skipped / records_salvaged / replaced
+# result.members is a tuple of per-member MigrationResult
+# result.post_commit_error is a warning string, never a failure
+
+records = read_log_group(["a.log", "b.log"])  # one consistent group snapshot
+```
+
+The member list must be a non-empty sequence without duplicate paths
+(a single path string is not a sequence); a non-sequence raises
+`TypeError`, an empty or duplicated list raises `ValueError` (CLI exit
+`2`).  A member that is missing or unreadable raises
+`FileNotFoundError` at both entry points (CLI exit `1`).
+
+### Group work files and the commit marker
+
+Group metadata lives next to the **first** listed member:
+
+- `.migrate-logs.lock` (sibling of the first member) — the group lock;
+- `.migrate-logs-tmp/` — the group work directory, holding
+  `manifest.json` (the member list plus the bad-record policy) and the
+  **group commit marker `group-committed`**;
+- `<file>.migrate-group-tmp/` — one directory per member (a sibling of
+  that member, so every rename stays within one directory and one
+  filesystem), holding that member's segmented output, its local
+  `checkpoint`, the assembled `final`, and the `prepared` marker;
+- `<file>.migrate-group-staged` and `<file>.migrate-group-backup` —
+  short-lived staging/backup names used by the rename protocol;
+- `<file>.committed` — the same per-file commit marker the single-file
+  entry publishes before its rename.
+
+**Purpose of the commit marker.** `group-committed` is the single
+success/failure border of the group.  It is created (temp file +
+atomic rename + directory fsync) only after *every* member's rename
+has landed and before any original is deleted.  A rerun checks it
+first: marker missing ⇒ the whole group is rolled back to the
+originals and the migration is retried; marker present ⇒ every member
+is completed forward (never rolled back).  The per-file
+`<file>.committed` marker gates `read_log`/`read_log_group`, so a
+reader can never open a post-rename inode under the pre-commit policy;
+like the single-file entry it is intentionally **kept** after a
+successful run so readers keep getting normalized views even when a
+writer later reopens the path and appends old-format records (an
+idempotent rerun rewrites those bytes).
+
+**Cleanup timing.** After the group marker is published, the run
+converges racing appenders per member, deletes each
+`<file>.migrate-group-backup`, and finally removes the group work
+directory `.migrate-logs-tmp/` (taking `group-committed`, the manifest
+and member temp state with it) and the per-member
+`<file>.migrate-group-tmp/` directories.  If that cleanup fails, or
+the process is killed first, nothing is lost: the marker survives, the
+next run finishes forward and sweeps the leftovers.  Any such
+durability/cleanup failure after the border is reported on stderr as a
+`warning:` (and in `post_commit_error`); the run still exits `0`.  The
+lock files are empty, reusable, and left in place like the
+single-file lock.
+
+### Cross-file two-phase rename and rollback
+
+Each member whose bytes change goes through the recoverable sequence
+`final → <file>.migrate-group-staged`, publish `<file>.committed`,
+`<file> → <file>.migrate-group-backup`,
+`<file>.migrate-group-staged → <file>` (each step directory-fsynced).
+Only once all members have completed this sequence is
+`group-committed` published.  A kill mid-sequence is resolved
+deterministically on the rerun from whichever of `staged`/`backup`/the
+live path survive: without the group marker every member is put back
+byte-for-byte as it was; with it the remaining renames are completed.
+
+### Checkpoints and group resume
+
+Each member writes the same fsynced segments and local checkpoint as a
+single-file run.  Once a member reaches the group commit phase it
+records `prepared`; on rerun it is neither rescanned nor rewritten —
+its `final` is reused — so an interrupted group finishes
+byte-for-byte identical to one uninterrupted run.  A member failure
+*before* the group border (including the first bad line in strict
+mode) rolls every prepared member back: no member's original file is
+modified and no partial intermediate is left in durable state.
+
+### Group snapshots and bad records
+
+`read_log_group([...])` reads the whole group in one call and returns a
+flat record list (members in list order, lines in file order) with no
+old/new field mix between or within members — including while a
+path-reopening appender writes old records during wrap-up.  While the
+entire group is still pre-commit and entirely old-format, records are
+returned exactly as stored (v1/v2); as soon as any member has crossed
+its border, every member is normalized to the current version in
+memory, which is exactly the eventual committed content.
+
+Bad-record rules are unchanged.  In strict mode the **first bad line of
+the whole group** (members in list order) raises `ValueError` and aborts
+before any rename; exit code is `3`.  In skip mode migration continues
+and each skipped record is written to **stderr** as
+
+    <filename>:<lineno>:<first 32 raw bytes>
+
+Missing/non-integer/unsupported `v`, wrong field types, and `NaN`,
+`Infinity` or values overflowing to infinity (e.g. `1e999`) are bad
+records; `-0.0` is preserved verbatim.  The summary counters count
+only records the invocation newly migrates; an idempotent finish reports
+`migrated=0`.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
@@ -152,6 +274,8 @@ recovery, post-commit fault classification, and idempotent reruns.
 - `proto_migrate.migrate(message, target_version) -> dict` converts a decoded message.
 - `proto_migrate.migrate_log_file(path, ...) -> MigrationResult` runs the online, resumable in-place log migration.
 - `proto_migrate.read_log(path) -> list[dict]` returns one version-consistent snapshot of a migrating log.
+- `proto_migrate.migrate_log_group(paths, ...) -> GroupMigrationResult` migrates an explicit group of logs as one all-or-nothing unit.
+- `proto_migrate.read_log_group(paths) -> list[dict]` returns one version-consistent snapshot of a whole group.
 - `proto_migrate.VERSIONS -> tuple[int, ...]` supported versions, ascending.
 - `proto_migrate.CURRENT_VERSION -> int` the version `dumps` writes.
 

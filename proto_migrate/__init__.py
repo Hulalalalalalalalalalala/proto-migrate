@@ -29,9 +29,14 @@ __all__ = [
     "migrate",
     "migrate_log_file",
     "read_log",
+    "migrate_log_group",
+    "read_log_group",
     "BadRecordError",
+    "GroupBadRecordError",
+    "GroupMigrationResult",
     "MigrationResult",
     "run_cli",
+    "run_group_cli",
 ]
 
 VERSIONS = (1, 2, 3)
@@ -166,4 +171,11 @@ from .log_migration import (  # noqa: E402
     migrate_log_file,
     read_log,
     run_cli,
+)
+from .group_migration import (  # noqa: E402
+    GroupBadRecordError,
+    GroupMigrationResult,
+    migrate_log_group,
+    read_log_group,
+    run_group_cli,
 )
