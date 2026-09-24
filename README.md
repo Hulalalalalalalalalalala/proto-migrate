@@ -37,17 +37,34 @@ Options: `--strict` (default) / `--skip` choose bad-record handling;
 `--quiesce-ms MS` (default 50 ms) is how long EOF must hold before the
 input is considered complete while appenders may still be writing.
 
-### Crash safety
+### Crash safety and resume
 
 Output goes to segmented temp files next to the target
-(`<file>.migrate-tmp/`), each segment is `fsync`ed, segments are
-assembled into one final temp file, and only after that file is fully
-fsynced is it atomically `os.replace`d over the original, followed by
-an fsync of the directory. If the process is killed at any point and
-rerun, the target is either the original file byte-for-byte or the
-complete migrated file — never a half-migrated file, and never a mix of
-old- and new-version records in one execution. Leftover temp files from
-a killed run are swept under an advisory lock
+(`<file>.migrate-tmp/`), each segment is `fsync`ed, and after every
+segment a checkpoint (source inode, consumed source offset, record
+counts, segment inventory) is appended to
+`<file>.migrate-tmp/checkpoint` and `fsync`ed. The segments are
+assembled into one final temp file, that file is `fsync`ed, and only
+then is it atomically `os.replace`d over the original, followed by an
+fsync of the directory.
+
+If the process is killed at any point and rerun, the run resumes from
+the newest checkpoint that still validates: already-migrated records
+are not re-scanned and not re-written, and the resumed result is
+byte-for-byte identical to a single uninterrupted run. A torn
+checkpoint tail, a corrupt checkpoint line, a missing segment file, or
+an over-long assembled file (killed mid tail-drain) is detected and
+rolled back to the newest checkpoint whose referenced files are all
+intact — all the way back to a fresh start if none validates. A source
+file whose identity changed (dev/inode) invalidates every checkpoint.
+The target path always names either the original file byte-for-byte or
+the complete migrated file — never a half-migrated file, and never a
+mix of old- and new-version records in one view.
+
+The atomic rename is the commit point: durability or cleanup failures
+after it (directory fsync, appender convergence, temp-dir removal) are
+reported as warnings on stderr, never as a failed migration. Leftover
+temp files from a killed run are reused or swept under an advisory lock
 (`<file>.migrate.lock`) before the next run.
 
 ### Concurrent readers and appenders
@@ -92,9 +109,12 @@ untouched (no rename, no mtime change). A second run rewrites no bytes.
     python3 -m unittest discover -s tests -t .
 
 The migration tests cover crash injection at each durability
-checkpoint (segment fsync, assembly, rename), records appended
-concurrently during the rewrite, post-rename appends, atomic reader
-views, and idempotent reruns.
+checkpoint (segment fsync, assembly, rename), checkpointed resume after
+real SIGKILLs, checkpoint corruption and missing-segment rollback,
+records appended concurrently during the rewrite, post-rename appends,
+three-party concurrency (migrator + appender + reader) across a kill
+and resume, atomic reader views, post-commit durability-failure
+classification, and idempotent reruns.
 
 ## Public interface
 

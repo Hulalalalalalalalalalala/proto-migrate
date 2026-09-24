@@ -7,8 +7,11 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
+from unittest import mock
 
 import proto_migrate
+import proto_migrate.log_migration as log_migration
 from proto_migrate import CURRENT_VERSION, dumps
 from proto_migrate.log_migration import (
     EXIT_BAD_RECORD,
@@ -496,6 +499,409 @@ class TestConcurrentAppend(unittest.TestCase):
                    for line in read_bytes(self.path).splitlines()]
         self.assertTrue(all(r["v"] == 3 for r in records))
         self.assertTrue(any(r["order_id"] == "later" for r in records))
+
+
+class TestCheckpointResume(unittest.TestCase):
+    """断点续传: a killed run resumes from its checkpoints instead of
+    re-scanning or re-writing the completed prefix, and the result is
+    byte-identical to a single uninterrupted run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "log.jsonl")
+        self.tmp_dir = self.path + ".migrate-tmp"
+        self.ckpt = os.path.join(self.tmp_dir, "checkpoint")
+        self.original = b"".join(v1(f"O{i}") for i in range(60))
+        with open(self.path, "wb") as f:
+            f.write(self.original)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _crash(self, checkpoint, on_bad="strict"):
+        return subprocess.run(
+            [sys.executable, "-c", CRASH_RUNNER, self.path,
+             checkpoint, on_bad, "200"],
+            capture_output=True,
+        )
+
+    def _reference(self):
+        """What one uninterrupted run produces for self.original."""
+        ref = os.path.join(self.tmp.name, "ref.jsonl")
+        with open(ref, "wb") as f:
+            f.write(self.original)
+        migrate_log_file(ref, quiesce=0.01)
+        return read_bytes(ref)
+
+    def _ckpt_lines(self):
+        with open(self.ckpt, "rb") as f:
+            return [json.loads(line) for line in f.read().splitlines()]
+
+    def test_resume_after_segment_crash_skips_completed_prefix(self):
+        proc = self._crash("segment")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        # Killed before the rename: original byte-for-byte intact.
+        self.assertEqual(read_bytes(self.path), self.original)
+        committed = self._ckpt_lines()[-1]
+        done = committed["migrated"]
+        self.assertGreater(done, 0)
+        self.assertLess(done, 60)
+        # Resume via the Python entry point with a different segment
+        # size: only the remaining records are scanned and written.
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated, 60 - done)
+        self.assertEqual(read_bytes(self.path), self._reference())
+        self.assertFalse(os.path.exists(self.tmp_dir))
+
+    def test_resume_after_segments_crash_scans_nothing(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertGreater(len(self._ckpt_lines()), 1)
+        # Every record was already committed to segments; the resumed
+        # run goes straight to assemble+replace and migrates zero.
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated, 0)
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_resume_after_assemble_crash_reuses_final(self):
+        proc = self._crash("assemble")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        last = self._ckpt_lines()[-1]
+        self.assertIn("final", last)
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated, 0)
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_torn_checkpoint_tail_rolls_back_to_last_complete_line(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        complete = self._ckpt_lines()
+        # Simulate a kill in the middle of a checkpoint write.
+        with open(self.ckpt, "ab") as f:
+            f.write(b'{"v":1,"ino":12')
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated,
+                         60 - complete[-1]["migrated"])
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_corrupt_checkpoint_line_rolls_back(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        lines = self._ckpt_lines()
+        self.assertGreater(len(lines), 2)
+        # Keep only the first checkpoint, then a corrupt line: the run
+        # must resume from the first checkpoint, not start over.
+        with open(self.ckpt, "wb") as f:
+            f.write(json.dumps(lines[0]).encode() + b"\n")
+            f.write(b'{"v":1,"ino":"not-an-inode"}\n')
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated, 60 - lines[0]["migrated"])
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_unusable_checkpoint_means_fresh_full_scan(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        with open(self.ckpt, "wb") as f:
+            f.write(b"total garbage\n")
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated, 60)
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_missing_segment_rolls_back_to_earlier_checkpoint(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        lines = self._ckpt_lines()
+        self.assertGreater(len(lines), 2)
+        # Drop a middle segment: every checkpoint that includes it is
+        # invalid, so the run rolls back to the last checkpoint whose
+        # segments all survive (here: the one covering only seg-000000).
+        os.remove(os.path.join(self.tmp_dir, "seg-000001"))
+        surviving = {n for n in os.listdir(self.tmp_dir) if n.startswith("seg-")}
+        valid = [ln for ln in lines
+                 if all(name in surviving for name, _size
+                        in ln.get("segments", []))]
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertGreater(valid[-1]["migrated"], 0)
+        self.assertEqual(result.records_migrated,
+                         60 - valid[-1]["migrated"])
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_source_replaced_invalidates_checkpoint(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        # A different file now lives at the path (new inode): the old
+        # checkpoints must not be applied to it.
+        fresh = b"".join(v1(f"N{i}") for i in range(5))
+        staging = self.path + ".staging"
+        with open(staging, "wb") as f:
+            f.write(fresh)
+        os.replace(staging, self.path)
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(result.records_migrated, 5)
+        records = [json.loads(line)
+                   for line in read_bytes(self.path).splitlines()]
+        self.assertEqual([r["order_id"] for r in records],
+                         [f"N{i}" for i in range(5)])
+        self.assertTrue(all(r["v"] == 3 for r in records))
+
+    def test_torn_final_truncated_back_to_checkpoint(self):
+        proc = self._crash("assemble")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        # Killed while draining the pre-rename tail into "final": the
+        # file is longer than the fsynced checkpoint size.  The resume
+        # truncates the excess and re-derives it from the source.
+        final = os.path.join(self.tmp_dir, "final")
+        with open(final, "ab") as f:
+            f.write(b"HALF-WRITTEN-TAIL")
+        result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertEqual(read_bytes(self.path), self._reference())
+
+    def test_idempotent_rerun_after_resume(self):
+        proc = self._crash("segments")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        migrate_log_file(self.path, quiesce=0.01)
+        once = read_bytes(self.path)
+        st = os.stat(self.path)
+        time.sleep(0.02)
+        again = migrate_log_file(self.path, quiesce=0.01)
+        self.assertFalse(again.replaced)
+        self.assertEqual(read_bytes(self.path), once)
+        self.assertEqual(os.stat(self.path).st_mtime_ns, st.st_mtime_ns)
+        self.assertEqual(os.stat(self.path).st_ino, st.st_ino)
+
+
+class TestRealKillRecovery(unittest.TestCase):
+    """崩溃注入后真杀恢复: SIGKILL a live CLI migration mid-scan, then
+    rerun to completion; the recovered result matches a single run."""
+
+    RECORDS = 50_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "log.jsonl")
+        self.ckpt = os.path.join(self.path + ".migrate-tmp", "checkpoint")
+        self.original = b"".join(v1(f"K{i}") for i in range(self.RECORDS))
+        with open(self.path, "wb") as f:
+            f.write(self.original)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _wait_for_committed_segments(self, proc, minimum):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            self.assertIsNone(proc.poll(), "migration finished before kill")
+            try:
+                with open(self.ckpt, "rb") as f:
+                    lines = [ln for ln in f.read().splitlines() if ln]
+            except OSError:
+                lines = []
+            if len(lines) >= minimum:
+                return lines
+            time.sleep(0.005)
+        self.fail("checkpoint never reached %d committed lines" % minimum)
+
+    def test_sigkill_mid_scan_then_rerun(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "proto_migrate", "migrate-log",
+             self.path, "--segment-size", "32768", "--quiesce-ms", "20"],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        lines = self._wait_for_committed_segments(proc, 2)
+        done = json.loads(lines[-1])["migrated"]
+        self.assertGreater(done, 0)
+        self.assertLess(done, self.RECORDS)
+        proc.kill()  # SIGKILL: no cleanup, no finally blocks
+        proc.wait()
+        self.assertNotEqual(proc.returncode, 0)
+        # The kill left the target byte-for-byte untouched.
+        self.assertEqual(read_bytes(self.path), self.original)
+
+        rerun = subprocess.run(
+            [sys.executable, "-m", "proto_migrate", "migrate-log",
+             self.path, "--segment-size", "32768", "--quiesce-ms", "20"],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(rerun.returncode, EXIT_OK, rerun.stderr)
+        self.assertIn("replaced=yes", rerun.stdout)
+        migrated_now = int(
+            rerun.stdout.split("migrated=")[1].split()[0]
+        )
+        # The resumed run only scanned the unfinished tail.
+        self.assertEqual(migrated_now, self.RECORDS - done)
+
+        # Byte-identical to one uninterrupted run.
+        ref = os.path.join(self.tmp.name, "ref.jsonl")
+        with open(ref, "wb") as f:
+            f.write(self.original)
+        migrate_log_file(ref, quiesce=0.01)
+        self.assertEqual(read_bytes(self.path), read_bytes(ref))
+        self.assertFalse(
+            os.path.exists(self.path + ".migrate-tmp")
+        )
+
+        # Idempotent afterwards.
+        third = subprocess.run(
+            [sys.executable, "-m", "proto_migrate", "migrate-log",
+             self.path],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(third.returncode, EXIT_OK, third.stderr)
+        self.assertIn("replaced=no", third.stdout)
+
+
+class TestThreePartyConcurrentResume(unittest.TestCase):
+    """三方并发 + 断点续传: migrator (CLI subprocess, killed and
+    resumed), a live appender, and concurrent readers, all at once."""
+
+    BASE = 20_000
+    APPENDED = 30
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "log.jsonl")
+        self.lock = self.path + ".migrate.lock"
+        self.ckpt = os.path.join(self.path + ".migrate-tmp", "checkpoint")
+        with open(self.path, "wb") as f:
+            for i in range(self.BASE):
+                f.write(v1(f"base-{i}"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_kill_and_resume_while_appending_and_reading(self):
+        stop = threading.Event()
+        snapshots = []
+        errors = []
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    with open(self.path, "rb") as f:
+                        blob = f.read()
+                    versions = versions_lenient(blob)
+                    if versions:
+                        snapshots.append((frozenset(versions), len(versions)))
+                    time.sleep(0.001)
+            except OSError as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def appender():
+            for _ in range(2000):
+                if os.path.exists(self.lock):
+                    break
+                time.sleep(0.001)
+            for i in range(self.APPENDED):
+                with open(self.path, "ab") as f:
+                    f.write(v2(f"late-{i}"))
+                time.sleep(0.002)
+
+        r = threading.Thread(target=reader)
+        t = threading.Thread(target=appender)
+        r.start()
+        t.start()
+
+        # First migration attempt: killed for real partway through.
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "proto_migrate", "migrate-log",
+             self.path, "--segment-size", "16384", "--quiesce-ms", "20"],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            self.assertIsNone(proc.poll(), "migration finished before kill")
+            if os.path.exists(self.ckpt) and os.path.getsize(self.ckpt) > 0:
+                break
+            time.sleep(0.005)
+        else:
+            self.fail("migration never committed a checkpoint")
+        proc.kill()
+        proc.wait()
+
+        # Resume while the appender and reader are still going.
+        rerun = subprocess.run(
+            [sys.executable, "-m", "proto_migrate", "migrate-log",
+             self.path, "--segment-size", "16384", "--quiesce-ms", "20"],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(rerun.returncode, EXIT_OK, rerun.stderr)
+        t.join()
+        stop.set()
+        r.join()
+
+        self.assertEqual(errors, [])
+        self.assertTrue(snapshots)
+        for present, _count in snapshots:
+            if 3 in present:
+                self.assertEqual(present, {3},
+                                 f"mixed view: {sorted(present)}")
+
+        blob = read_bytes(self.path)
+        records = [json.loads(line) for line in blob.splitlines()]
+        # Zero loss, zero duplication.
+        self.assertEqual(len(records), self.BASE + self.APPENDED)
+        ids = [rec["order_id"] for rec in records]
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertTrue(all(rec["v"] == CURRENT_VERSION for rec in records))
+        # Original append order is preserved within each stream.
+        base_seq = [i for i in ids if i.startswith("base-")]
+        late_seq = [i for i in ids if i.startswith("late-")]
+        self.assertEqual(base_seq, [f"base-{i}" for i in range(self.BASE)])
+        self.assertEqual(late_seq, [f"late-{i}" for i in range(self.APPENDED)])
+
+        # Idempotent once everything settled.
+        again = migrate_log_file(self.path, quiesce=0.02)
+        self.assertFalse(again.replaced)
+        self.assertEqual(read_bytes(self.path), blob)
+
+
+class TestPostCommitFailure(unittest.TestCase):
+    """错误分类: durability/cleanup failures after the atomic rename
+    must not turn a committed migration into a reported failure."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "log.jsonl")
+        with open(self.path, "wb") as f:
+            f.write(v1("A") + v2("B"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_dir_fsync_failure_after_commit_is_warning_not_failure(self):
+        parent = os.path.dirname(os.path.abspath(self.path))
+        real_fsync_dir = log_migration._fsync_dir
+
+        def flaky_fsync_dir(dirpath):
+            if os.path.abspath(dirpath) == parent:
+                raise OSError("simulated post-commit fsync failure")
+            return real_fsync_dir(dirpath)
+
+        with mock.patch.object(
+            log_migration, "_fsync_dir", flaky_fsync_dir
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = migrate_log_file(self.path, quiesce=0.01)
+        self.assertTrue(result.replaced)
+        self.assertTrue(
+            any("fsync" in str(w.message) for w in caught),
+            [str(w.message) for w in caught],
+        )
+        # The migration itself committed: fully migrated output.
+        self.assertEqual(versions_of(read_bytes(self.path)), [3, 3])
+        # And the next run is a clean idempotent no-op.
+        again = migrate_log_file(self.path, quiesce=0.01)
+        self.assertFalse(again.replaced)
 
 
 class TestCommandLine(unittest.TestCase):
