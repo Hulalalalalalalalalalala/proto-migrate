@@ -40,13 +40,34 @@ In ``"strict"`` mode the first bad line *or* bad reference of the whole
 run (groups in list order, members in list order, lines in file order)
 raises :class:`LinkedBadReferenceError` / :class:`GroupBadRecordError`
 (both :class:`ValueError`) before any rename, leaving every original
-untouched.  In ``"skip"`` mode bad lines are skipped exactly as in the
+untouched: bad lines and bad references are compared in that global
+order and the earliest one decides which exception is raised, so a bad
+reference that sorts before a later member's bad line is reported
+first.  In ``"skip"`` mode bad lines are skipped exactly as in the
 single-group migration and records holding bad references are dropped
 from the migrated output; each dropped record is audited to the audit
 stream as ``<filename>:<lineno>:<first 32 raw bytes>``.  The summary
 counts bad records (``records_skipped``) and bad references
 (``references_bad``) separately, and both counters only cover records
 this invocation newly migrated and references it newly resolved.
+
+Multi-instance coordination
+---------------------------
+Several migration instances may run concurrently, over overlapping or
+disjoint group sets.  Every member is held under a non-blocking lease
+-- an exclusive ``flock`` on its ``<path>.migrate.lock`` file, the same
+lock the single-file and single-group migrators wait on -- so
+overlapping members are mutually exclusive while disjoint group sets
+advance in parallel (each group set owns a distinct
+``.migrate-linked-tmp-<hash>`` work directory next to its first
+member).  A lease held by a live instance raises
+:class:`MigrationLockedError` instead of waiting; a holder that
+finishes or disappears (its process exits, however abruptly) releases
+its leases via the OS, and the next instance reclaims them and takes
+over from the durable checkpoints without rescanning prepared members.
+Takeover and resume leave no partial migration shape: the outcome is
+byte-for-byte identical to running the same instances serially.  Lease
+and index state lives only in local files and can always be rebuilt.
 
 Durability, resume and snapshots
 --------------------------------
@@ -61,28 +82,39 @@ rescanning them, rebuilds the reference index from those durable
 indexes, and finishes byte-for-byte identical to one uninterrupted
 run.  The group commit marker ``linked-committed`` is the single
 success/failure border; durability or cleanup failures after it are
-warnings (exit 0), never failures.
+warnings (exit 0), never failures.  A recovery run that finds the
+commit marker converges appends still living on a member's backup
+inode *before* the backup is removed, so no record appended across the
+crash is lost.
 
 :func:`read_linked_logs` returns one version-consistent snapshot of
 every group in a single call -- old and new field shapes never mix
 between groups, between members or inside a member, including while a
 path-reopening appender writes old records during wrap-up.
+:func:`read_linked_logs_stream` serves the same snapshot in
+cursor-resumable batches (group by group, member by member), pinned at
+the first call and never loading a whole group into memory.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
+import hashlib
+import itertools
 import json
 import os
 import shutil
 import sqlite3
 import struct
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from typing import NamedTuple
 
-from . import CURRENT_VERSION, migrate
+from . import CURRENT_VERSION, loads, migrate
 from .log_migration import (
     DEFAULT_QUIESCE,
     DEFAULT_SEGMENT_SIZE,
@@ -95,13 +127,17 @@ from .log_migration import (
     BadRecordError,
     MigrationResult,
     _audit_line,
+    _commit_marker_path,
     _converge,
+    _convert,
     _crash_point,
+    _emit,
     _fsync_dir,
+    _read_lines,
 )
 from .group_migration import (
+    GroupBadRecordError,
     _AuditPrefix,
-    _acquire_member_locks,
     _prepare_member,
     _probe_members,
     _publish_member_marker,
@@ -112,13 +148,14 @@ from .group_migration import (
 __all__ = [
     "LinkedBadReferenceError",
     "LinkedMigrationResult",
+    "MigrationLockedError",
     "migrate_linked_logs",
     "read_linked_logs",
+    "read_linked_logs_stream",
     "run_linked_cli",
 ]
 
 _LINKED_DIR_NAME = ".migrate-linked-tmp"
-_LINKED_LOCK_NAME = ".migrate-linked.lock"
 _LINKED_COMMITTED = "linked-committed"
 _LINKED_COMMITTED_TMP = "linked-committed.tmp"
 _MANIFEST = "manifest.json"
@@ -163,6 +200,17 @@ class LinkedBadReferenceError(ValueError):
         self.raw = raw
         self.cause = cause
         super().__init__(f"{path}: line {lineno}: bad reference: {cause}")
+
+
+class MigrationLockedError(RuntimeError):
+    """A member lease is held by another live migration instance.
+
+    Leases are non-blocking: while an active instance holds the lease
+    of a member this run needs, the run fails fast instead of waiting.
+    Once the holder finishes or disappears (its process exits, however
+    abruptly), the lease is released by the OS and the next run
+    reclaims it, taking over from the durable checkpoints.
+    """
 
 
 class LinkedMigrationResult(NamedTuple):
@@ -259,8 +307,72 @@ def _normalize_links(links, group_count):
 
 
 def _linked_group_dir(groups):
+    """The group work directory, scoped to the exact member set.
+
+    The directory is keyed by a hash of the absolute member lists so
+    that several migration instances with *disjoint* group sets anchored
+    in the same directory advance in parallel, while instances over the
+    same members deterministically find (and resume) each other's
+    durable state.  The bad-record policy and the link set stay in the
+    manifest, so a policy/link change reuses -- and validates -- the
+    same directory.
+    """
     first_dir = os.path.dirname(os.path.abspath(groups[0][0]))
-    return os.path.join(first_dir, _LINKED_DIR_NAME)
+    key = json.dumps(
+        [[os.path.abspath(p) for p in g] for g in groups],
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(first_dir, f"{_LINKED_DIR_NAME}-{digest}")
+
+
+def _acquire_member_leases(paths):
+    """Take a non-blocking lease on every member (list order).
+
+    The lease is an exclusive ``flock`` on the member's
+    ``<path>.migrate.lock`` file -- the same lock file the single-file
+    and single-group migrators wait on, so every migration flavour
+    mutually excludes on a shared member.  A lease held by a live
+    instance raises :class:`MigrationLockedError` immediately; a holder
+    that disappeared released its locks via the OS, so the next
+    instance reclaims them and takes over from the durable checkpoints.
+    Already-taken leases are released before the error propagates.
+    """
+    fhs = []
+    try:
+        for path in paths:
+            fh = open(path + ".migrate.lock", "a+b")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fh.close()
+                raise MigrationLockedError(
+                    f"member {path!r} is leased by an active migration "
+                    f"instance"
+                )
+            fhs.append(fh)
+    except BaseException:
+        for fh in fhs:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
+        raise
+    return fhs
+
+
+@contextlib.contextmanager
+def _member_leases(paths):
+    """Hold every member's lease for the duration of the run."""
+    fhs = _acquire_member_leases(paths)
+    try:
+        yield fhs
+    finally:
+        for fh in fhs:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
 
 
 def _linked_member_dir(path):
@@ -391,15 +503,17 @@ class _LineIndex:
 
     One variable-length record per consumed line: a ``<qBBI`` header
     (source offset, kind, reserved, projection length) followed by the
-    projection -- a JSON object of the link-involved string fields of
-    the *migrated* record (or, for a skipped line, of a lenient parse
-    of the raw line).  The index is fsynced before every checkpoint
-    record, so a trusted checkpoint never covers unindexed lines.
+    projection -- a JSON object of every string field of the *migrated*
+    record (or, for a skipped line, of a lenient parse of the raw
+    line).  Projecting all string fields -- not just the fields one
+    link set touches -- keeps the index reusable by a different
+    instance taking the member over with a different link set.  The
+    index is fsynced before every checkpoint record, so a trusted
+    checkpoint never covers unindexed lines.
     """
 
-    def __init__(self, member_dir, fields):
+    def __init__(self, member_dir):
         self._path = os.path.join(member_dir, _LINES_NAME)
-        self._fields = tuple(sorted(fields))
         self._fh = None
 
     def begin(self, total_lines, resumed):
@@ -444,8 +558,6 @@ class _LineIndex:
         self._fh.write(blob)
 
     def _project(self, kind, payload):
-        if not self._fields:
-            return {}
         try:
             if kind == LINE_GOOD:
                 # The migrated, canonical output bytes.
@@ -462,10 +574,7 @@ class _LineIndex:
             return {}
         if not isinstance(obj, dict):
             return {}
-        return {
-            f: obj[f] for f in self._fields
-            if isinstance(obj.get(f), str)
-        }
+        return {k: v for k, v in obj.items() if isinstance(v, str)}
 
     def sync(self):
         self._fh.flush()
@@ -531,12 +640,19 @@ class _LinkedMember:
 
 
 def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
-                           segment_size, quiesce, audit_stream, fields):
-    """Prepare one member with its durable line index."""
+                           segment_size, quiesce, audit_stream):
+    """Prepare one member with its durable line index.
+
+    In strict mode bad lines are deferred (recorded in the line index,
+    never audited, never raised) so the run can compare every member's
+    first bad line against the first bad reference and report the
+    globally first problem in group/member/line order.
+    """
     member = _prepare_member(
         path, member_dir, on_bad, segment_size, quiesce,
         _AuditPrefix(audit_stream, path),
-        line_index=_LineIndex(member_dir, fields),
+        line_index=_LineIndex(member_dir),
+        defer_bad=(on_bad == "strict"),
     )
     if _count_line_entries(member_dir) != member.lineno:
         # The line index and the checkpoints disagree (e.g. the index
@@ -550,7 +666,8 @@ def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
         member = _prepare_member(
             path, member_dir, on_bad, segment_size, quiesce,
             _AuditPrefix(audit_stream, path),
-            line_index=_LineIndex(member_dir, fields),
+            line_index=_LineIndex(member_dir),
+            defer_bad=(on_bad == "strict"),
         )
     _write_linked_prepared(member_dir, {
         "dirty": member.dirty, "offset": member.offset,
@@ -597,6 +714,21 @@ def _resume_linked_prepared(index, group_index, path, member_dir, on_bad):
         index, group_index, path, member_dir, src, bool(info["dirty"]),
         int(info["offset"]), lineno, 0, 0, lineno,
     )
+
+
+def _first_indexed_bad_line(member):
+    """``(lineno0, offset)`` of the member's first bad source line, if any.
+
+    Strict mode defers bad lines during prepare instead of raising, so
+    the durable line index is the record of them -- for freshly scanned
+    and checkpoint-resumed members alike.
+    """
+    for lineno0, offset, kind, _proj in _stream_line_entries(
+        member.member_dir
+    ):
+        if kind != LINE_GOOD:
+            return lineno0, offset
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +1061,165 @@ def _undo_staged_members(members):
 # ---------------------------------------------------------------------------
 
 
+def _copy_complete_tail(src_fd, pos, out):
+    """Copy ``src_fd[pos:]`` through its last complete line into *out*.
+
+    Returns the source offset of that last newline; a torn tail still
+    being appended is left for the caller's convergence pass to drain
+    from the source inode once the record completes.
+    """
+    src_fd.seek(pos)
+    carry = b""
+    boundary = pos
+    while True:
+        chunk = src_fd.read(1 << 20)
+        if not chunk:
+            break
+        data = carry + chunk
+        cut = data.rfind(b"\n")
+        if cut == -1:
+            carry = data
+            continue
+        out.write(data[:cut + 1])
+        boundary += cut + 1
+        carry = data[cut + 1:]
+    return boundary
+
+
+def _insert_into_live(path, pos, data, member_dir, parent):
+    """Atomically splice *data* into the live file at byte *pos*.
+
+    Returns ``(fd, offset)``: the pre-replace live inode and the offset
+    up to which its complete lines were copied.  Bytes a racing writer
+    lands on that inode afterwards are drained by the caller's
+    convergence pass, so nothing appended during the replace is lost.
+    """
+    os.makedirs(member_dir, exist_ok=True)
+    tmp = os.path.join(member_dir, "salvage-final")
+    old = open(path, "rb")
+    try:
+        with open(tmp, "wb") as out:
+            old.seek(0)
+            remaining = pos
+            while remaining:
+                chunk = old.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                remaining -= len(chunk)
+            out.write(data)
+            boundary = _copy_complete_tail(old, pos, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(parent)
+    except BaseException:
+        old.close()
+        raise
+    return old, boundary
+
+
+def _salvage_backup_tail(path, backup_path, offset, lineno, on_bad,
+                         audit_stream, member_dir, quiesce):
+    """Converge records that exist only on the backup inode into the live
+    file, before the backup is removed.
+
+    A crash between the group commit marker and the end of convergence
+    leaves the pre-rename inode behind as the backup; records appended
+    to it after the prepare drain (or after the crashed run's last
+    convergence round) exist nowhere else.  Migrated backup-tail
+    records already forming a prefix of the live tail (a partially
+    completed convergence) are recognised and not duplicated; the rest
+    is spliced in ahead of any younger post-commit content, one atomic
+    replace per round, and the backup is re-drained until it stays
+    empty for a whole round, so an appender still holding the backup
+    inode finishes its in-flight records first.
+
+    Returns ``(salvaged, skipped, gens, complete)``: only records this
+    invocation actually moves are counted; *gens* is a list of
+    ``(fd, offset)`` older live inodes (replaced by the splices) whose
+    late appends the caller's convergence must still drain; *complete*
+    is false when a non-stop appender hit the backstop -- the caller
+    keeps the backup and reports a warning instead of dropping it.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    follow = max(1.0, quiesce * 20)
+    deadline = time.monotonic() + max(5.0, quiesce * 200)
+    src = open(backup_path, "rb")
+    cur_off = offset
+    cur_lineno = lineno
+    live_pos = None
+    salvaged = skipped = 0
+    gens = []
+    complete = True
+    try:
+        while True:
+            # Drain the backup's complete lines from cur_off, waiting
+            # out one quiesce window at EOF for in-flight records.
+            tail = []
+            for raw in _read_lines(src, quiesce, offset=cur_off,
+                                   follow=follow):
+                tail.append(raw)
+                cur_off += len(raw)
+            if not tail:
+                break
+            if time.monotonic() >= deadline:
+                complete = False
+                break
+            if live_pos is None:
+                # Byte offset just past the migrated prefix: the live
+                # file's first `lineno` lines are the migrated image of
+                # the backup's first `offset` bytes.
+                pos = 0
+                with open(path, "rb") as live:
+                    for _ in range(lineno):
+                        line = live.readline()
+                        if not line:
+                            break
+                        pos += len(line)
+                live_pos = pos
+            insert = bytearray()
+            idx = 0
+            with open(path, "rb") as live:
+                live.seek(live_pos)
+                while idx < len(tail):
+                    raw = tail[idx]
+                    cur_lineno += 1
+                    try:
+                        out = _convert(raw)
+                    except ValueError as exc:
+                        if on_bad == "strict":
+                            raise BadRecordError(
+                                cur_lineno, raw, exc) from exc
+                        audit_stream.write(_audit_line(cur_lineno, raw))
+                        audit_stream.flush()
+                        skipped += 1
+                        idx += 1
+                        continue
+                    here = live.readline()
+                    if here == out:
+                        # Already converged by the crashed run.
+                        live_pos += len(here)
+                        idx += 1
+                        continue
+                    break
+            for raw in tail[idx:]:
+                cur_lineno += 1
+                out, bad = _emit(audit_stream, on_bad, raw, cur_lineno)
+                if bad:
+                    skipped += 1
+                    continue
+                insert.extend(out)
+                salvaged += 1
+            if insert:
+                gens.append(_insert_into_live(
+                    path, live_pos, insert, member_dir, parent))
+                live_pos += len(insert)
+    finally:
+        src.close()
+    return salvaged, skipped, gens, complete
+
+
 def _converge_and_finalize(staged_members, paths, group_dir, on_bad,
                            quiesce, audit_stream):
     """Converge racing appenders, delete backups, sweep work dirs."""
@@ -980,10 +1271,14 @@ def _finish_committed_linked(paths, group_dir, on_bad,
     """Finish a run whose commit marker already exists (a rerun).
 
     The border was crossed, so every fault here is a warning.  Each
-    member is finished exactly like an idempotent single-group rerun:
-    the current inode is rescanned (re-encoding a canonical file
-    changes no bytes), any old-format tail a path-reopening appender
-    landed after wrap-up is migrated through a fresh atomic
+    member is finished exactly like an idempotent single-group rerun --
+    except that a surviving backup is *converged before it is removed*:
+    records a crashed run left only on the pre-rename inode (appends
+    that landed after its prepare drain or its last convergence round)
+    are spliced into the live file first, so no appended record is
+    lost.  Then the current inode is rescanned (re-encoding a canonical
+    file changes no bytes), any old-format tail a path-reopening
+    appender landed after wrap-up is migrated through a fresh atomic
     replacement, and racing appenders are converged.  Counters count
     only records this invocation newly moves.
     """
@@ -994,48 +1289,111 @@ def _finish_committed_linked(paths, group_dir, on_bad,
     for path in paths:
         parent = os.path.dirname(os.path.abspath(path))
         d = _linked_debris(path)
-        try:
-            _remove(d["backup"])
-            _fsync_dir(parent)
-        except OSError as exc:
-            warnings.append(f"{path}: backup removal failed: {exc}")
-
         member_dir = _linked_member_dir(path)
-        shutil.rmtree(member_dir, ignore_errors=True)
+        member_migrated = member_skipped = 0
         member_replaced = False
-        salvaged = conv_skipped = 0
+        extra_gens = []
         try:
+            if os.path.exists(d["backup"]):
+                # The backup is the pre-rename inode.  The durable
+                # prepared marker names where its drain stopped, so the
+                # not-yet-converged tail can be told apart from the
+                # migrated prefix and salvaged before the backup goes.
+                info = _read_linked_prepared(member_dir)
+                if info is None:
+                    warnings.append(
+                        f"{path}: prepared state lost; cannot converge "
+                        f"the backup, dropping it"
+                    )
+                    _remove(d["backup"])
+                    _fsync_dir(parent)
+                else:
+                    salv, skip, gens, complete = _salvage_backup_tail(
+                        path, d["backup"], int(info["offset"]),
+                        int(info["lineno"]), on_bad,
+                        _AuditPrefix(audit_stream, path), member_dir,
+                        quiesce,
+                    )
+                    member_migrated += salv
+                    member_skipped += skip
+                    extra_gens.extend(gens)
+                    if complete:
+                        _remove(d["backup"])
+                        _fsync_dir(parent)
+                    else:
+                        # A non-stop appender hit the backstop: keep the
+                        # backup AND the prepared state that describes
+                        # it, and leave this member to the next rerun
+                        # instead of finishing it now.
+                        warnings.append(
+                            f"{path}: backup still receiving appends at "
+                            f"the backstop; rerun to finish"
+                        )
+                        for fd, _off in extra_gens:
+                            try:
+                                fd.close()
+                            except OSError:
+                                pass
+                        migrated_total += member_migrated
+                        skipped_total += member_skipped
+                        salvaged_total += member_migrated
+                        member_results.append(MigrationResult(
+                            path=path, records_migrated=member_migrated,
+                            records_skipped=member_skipped,
+                            records_salvaged=member_migrated,
+                            replaced=False,
+                        ))
+                        continue
+
+            member_dir = _linked_member_dir(path)
+            shutil.rmtree(member_dir, ignore_errors=True)
             member = _prepare_member(
                 path, member_dir, on_bad, segment_size, quiesce,
                 _AuditPrefix(audit_stream, path),
             )
-            if member.dirty:
-                staged_path = os.path.join(member_dir, _FINAL)
-                os.replace(staged_path, path + _STAGED_SUFFIX)
-                _publish_member_marker(path)
-                os.replace(path, path + _BACKUP_SUFFIX)
-                os.replace(path + _STAGED_SUFFIX, path)
-                _fsync_dir(parent)
-                member_replaced = True
-                salvaged, conv_skipped, _lineno, warning = _converge(
-                    path, parent, member_dir, member.src, member.offset,
-                    member.lineno, quiesce,
-                    _AuditPrefix(audit_stream, path), on_bad,
-                )
-                if warning:
-                    warnings.append(f"{path}: {warning}")
-                _remove(path + _BACKUP_SUFFIX)
-                _fsync_dir(parent)
             try:
-                member.src.close()
-            except OSError:
-                pass
-            migrated_total += salvaged
-            skipped_total += conv_skipped
-            salvaged_total += salvaged
+                if member.dirty:
+                    staged_path = os.path.join(member_dir, _FINAL)
+                    os.replace(staged_path, path + _STAGED_SUFFIX)
+                    _publish_member_marker(path)
+                    os.replace(path, path + _BACKUP_SUFFIX)
+                    os.replace(path + _STAGED_SUFFIX, path)
+                    _fsync_dir(parent)
+                    member_replaced = True
+                    extra_gens.append((member.src, member.offset))
+                if extra_gens:
+                    # _converge takes the youngest generation as its
+                    # source; older generations go first.
+                    src_fd, src_off = extra_gens[-1]
+                    salvaged, conv_skipped, _lineno, warning = _converge(
+                        path, parent, member_dir, src_fd, src_off,
+                        member.lineno, quiesce,
+                        _AuditPrefix(audit_stream, path), on_bad,
+                        extra_gens=extra_gens[:-1],
+                    )
+                    member_migrated += salvaged
+                    member_skipped += conv_skipped
+                    if warning:
+                        warnings.append(f"{path}: {warning}")
+                    _remove(path + _BACKUP_SUFFIX)
+                    _fsync_dir(parent)
+            finally:
+                try:
+                    member.src.close()
+                except OSError:
+                    pass
+                for fd, _off in extra_gens:
+                    try:
+                        fd.close()
+                    except OSError:
+                        pass
+            migrated_total += member_migrated
+            skipped_total += member_skipped
+            salvaged_total += member_migrated
             member_results.append(MigrationResult(
-                path=path, records_migrated=salvaged,
-                records_skipped=conv_skipped, records_salvaged=salvaged,
+                path=path, records_migrated=member_migrated,
+                records_skipped=member_skipped,
+                records_salvaged=member_migrated,
                 replaced=member_replaced,
             ))
         except (OSError, ValueError) as exc:
@@ -1080,12 +1438,23 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
     is a sequence of ``(src_group, dst_group, src_field, dst_field)``
     declarations.  Returns a :class:`LinkedMigrationResult` whose
     counters count only records this invocation newly migrates and
-    references it newly resolves.
+    references it newly resolves; member-level and group-level counts
+    always agree, and a resumed or idempotent run reports zero.
+
+    Several instances may run concurrently: every member is held under
+    a non-blocking lease (its ``<path>.migrate.lock`` file), so
+    overlapping members are mutually exclusive while disjoint group
+    sets advance in parallel.  A member whose lease is held by a live
+    instance raises :class:`MigrationLockedError`; once the holder
+    finishes or disappears the lease is reclaimed and the next run
+    takes over from the durable checkpoints, byte-identical to running
+    the same instances serially.
 
     Raises :class:`TypeError` for a non-sequence group list,
     :class:`ValueError` for an empty or duplicated list (and
     :class:`LinkedBadReferenceError` / :class:`GroupBadRecordError` on
-    the first bad reference or bad line in strict mode), and
+    the globally first bad reference or bad line in strict mode --
+    compared in group, member and line order), and
     :class:`FileNotFoundError` when a member is missing or unreadable.
     """
     if on_bad not in ("strict", "skip"):
@@ -1098,17 +1467,12 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
     _probe_members(paths)
 
     audit_stream = audit if audit is not None else sys.stderr.buffer
-    first_dir = os.path.dirname(os.path.abspath(groups[0][0]))
     group_dir = _linked_group_dir(groups)
-    lock_path = os.path.join(first_dir, _LINKED_LOCK_NAME)
 
-    # Link-involved fields, and per-group source/target link views.
-    fields = set()
+    # Per-group source/target link views.
     dst_links = {}   # group index -> [(link_id, dst_field)]
     src_links = {}   # group index -> [(link_id, src_field)]
     for link_id, (src_g, dst_g, src_field, dst_field) in enumerate(links):
-        fields.add(src_field)
-        fields.add(dst_field)
         dst_links.setdefault(dst_g, []).append((link_id, dst_field))
         src_links.setdefault(src_g, []).append((link_id, src_field))
 
@@ -1118,9 +1482,7 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
     references_bad = 0
     post_commit_error = None
 
-    with open(lock_path, "a+b") as group_lock:
-        fcntl.flock(group_lock, fcntl.LOCK_EX)
-        member_locks = _acquire_member_locks(paths)
+    with _member_leases(paths):
         try:
             _crash_point("linked-lock")
 
@@ -1196,7 +1558,7 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                             member = _prepare_linked_member(
                                 index, group_index, path, member_dir,
                                 on_bad, segment_size, quiesce,
-                                audit_stream, fields,
+                                audit_stream,
                             )
                         members.append(member)
                         index += 1
@@ -1224,16 +1586,47 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                 finally:
                     refs.close()
 
-                if on_bad == "strict" and first is not None:
-                    mi, lineno0, reason, link_id, value = first
-                    member = members[mi]
-                    src_g, dst_g, src_field, dst_field = links[link_id]
-                    raw = _read_source_line(member, lineno0)
-                    raise LinkedBadReferenceError(
-                        member.path, lineno0 + 1, raw,
-                        f"{_REASON_TEXT[reason]}: "
-                        f"{dst_field}={value!r} in group {dst_g}",
-                    )
+                if on_bad == "strict":
+                    # The globally first problem -- bad line or bad
+                    # reference, in group/member/line order -- decides
+                    # which exception is raised.  Bad lines were
+                    # deferred during prepare, so every member's first
+                    # bad line is on record; a bad reference that sorts
+                    # before a later member's bad line is reported
+                    # first.
+                    bad_line = None
+                    for member in members:
+                        hit = _first_indexed_bad_line(member)
+                        if hit is not None:
+                            bad_line = (member, hit[0], hit[1])
+                            break
+                    if bad_line is not None and (
+                        first is None
+                        or (bad_line[0].index, bad_line[1])
+                        < (first[0], first[1])
+                    ):
+                        member, lineno0, offset = bad_line
+                        with open(member.path, "rb") as f:
+                            f.seek(offset)
+                            raw = f.readline()
+                        try:
+                            _convert(raw)
+                            cause = ValueError("undecodable record")
+                        except ValueError as exc:
+                            cause = exc
+                        raise GroupBadRecordError(
+                            member.path, lineno0 + 1, raw, cause
+                        )
+                    if first is not None:
+                        mi, lineno0, reason, link_id, value = first
+                        member = members[mi]
+                        src_g, dst_g, src_field, dst_field = links[link_id]
+                        raw = _read_source_line(member, lineno0)
+                        raise LinkedBadReferenceError(
+                            member.path, lineno0 + 1, raw,
+                            f"{_REASON_TEXT[reason]}: "
+                            f"{dst_field}={value!r} in group {dst_g}",
+                        )
 
                 # --- FILTER bad-reference records out of the output.
                 for member in members:
@@ -1312,20 +1705,24 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                     member.src.close()
                 except OSError:
                     pass
-            for fh in member_locks:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-                fh.close()
 
-    totals_migrated = sum(m.run_migrated for m in staged_members)
-    totals_skipped = sum(m.run_skipped for m in staged_members)
-    totals_salvaged = sum(m.salvaged for m in staged_members)
+    # Counters count only records this invocation actually rewrote: a
+    # member whose bytes never changed (canonical input, no dropped
+    # records) reports zero, so member-level and group-level counts
+    # always agree, and a resumed or idempotent run reports zero.
+    def rewritten(m):
+        return m.dirty or bool(m.dropped)
+
+    totals_migrated = sum(m.run_migrated for m in members if rewritten(m))
+    totals_skipped = sum(m.run_skipped for m in members if rewritten(m))
+    totals_salvaged = sum(m.salvaged for m in members if rewritten(m))
     member_results = tuple(
         MigrationResult(
             path=m.path,
-            records_migrated=m.run_migrated,
-            records_skipped=m.run_skipped,
+            records_migrated=m.run_migrated if rewritten(m) else 0,
+            records_skipped=m.run_skipped if rewritten(m) else 0,
             records_salvaged=m.salvaged,
-            replaced=replaced and (m.dirty or bool(m.dropped)),
+            replaced=replaced and rewritten(m),
         )
         for m in members
     )
@@ -1403,6 +1800,344 @@ def read_linked_logs(groups, *, quiesce=DEFAULT_QUIESCE):
 
 
 # ---------------------------------------------------------------------------
+# Cursor-based streaming snapshot
+# ---------------------------------------------------------------------------
+#
+# read_linked_logs_stream serves the same single, version-consistent
+# snapshot as read_linked_logs, but in batches: every call returns at
+# most ``batch_records`` records plus an opaque string cursor, and the
+# next call resumes exactly where the previous one stopped.  The
+# snapshot is pinned at the first call -- every member's inode is held
+# open and its length frozen -- so batches never repeat or lose records
+# and never mix old/new field shapes, however long the stream stays
+# open and whatever appenders do meanwhile.  The cursor is a plain
+# string: it can be persisted and resumed later, in this process or
+# (while the pinned inodes still resolve by path) in another one.
+
+_CURSOR_VERSION = 1
+_STREAM_SESSIONS = {}
+_STREAM_LOCK = threading.Lock()
+_STREAM_TOKENS = itertools.count(1)
+
+
+def _open_path_wait(path, quiesce):
+    """Open *path* for reading, riding out the mid-rename gap."""
+    deadline = time.monotonic() + max(0.05, quiesce * 10)
+    while True:
+        try:
+            return open(path, "rb")
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(max(quiesce, 0.001))
+
+
+def _probe_stream_member(path, quiesce):
+    """The member the cursor points to must still exist and be readable."""
+    deadline = time.monotonic() + max(0.05, quiesce * 10)
+    while True:
+        try:
+            with open(path, "rb"):
+                return
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise FileNotFoundError(
+                    f"linked stream member missing: {path!r}"
+                )
+            time.sleep(max(quiesce, 0.001))
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"linked stream member unreadable: {path!r}: {exc}"
+            ) from exc
+
+
+def _open_stream_session(paths, quiesce):
+    """Pin every member's inode and freeze its snapshot length.
+
+    Mirrors :func:`read_linked_logs`' marker gate per member: the
+    descriptor pins one inode, the commit marker is rechecked after the
+    open, and the snapshot covers exactly the bytes present at that
+    moment.  Returns ``(fds, ends, posts)``.
+    """
+    fds = []
+    try:
+        ends = []
+        posts = []
+        for path in paths:
+            marker = _commit_marker_path(path)
+            post = os.path.exists(marker)
+            fd = _open_path_wait(path, quiesce)
+            try:
+                st = os.fstat(fd.fileno())
+            except OSError:
+                fd.close()
+                raise
+            if not post and os.path.exists(marker):
+                post = True
+            fds.append(fd)
+            ends.append(st.st_size)
+            posts.append(post)
+    except BaseException:
+        for fd in fds:
+            fd.close()
+        raise
+    return fds, ends, posts
+
+
+def _stream_policy(fds, ends, posts):
+    """1 = normalize every record to the current version, 0 = as stored.
+
+    The decision mirrors :func:`read_linked_logs`: post-commit when any
+    member crossed its border, else raw only when every stored record
+    is pre-current.  The scan is streaming -- records are decoded one
+    line at a time and never held -- so no group is loaded into memory.
+    """
+    if any(posts):
+        return 1
+    for fd, end in zip(fds, ends):
+        fd.seek(0)
+        pos = 0
+        while pos < end:
+            line = fd.readline(end - pos)
+            if not line or not line.endswith(b"\n"):
+                break
+            pos += len(line)
+            try:
+                rec = loads(line)
+            except ValueError:
+                # Undecodable lines are not current-version records;
+                # they raise when the stream reaches them, exactly like
+                # the one-shot read.
+                continue
+            if rec["v"] == CURRENT_VERSION:
+                return 1
+    return 0
+
+
+def _drop_stream_session(token):
+    with _STREAM_LOCK:
+        session = _STREAM_SESSIONS.pop(token, None)
+    if session is not None:
+        for fd in session["fds"]:
+            if fd is not None:
+                try:
+                    fd.close()
+                except OSError:
+                    pass
+
+
+def _encode_cursor(token, session, mi, off):
+    return json.dumps({
+        "v": _CURSOR_VERSION,
+        "tok": token,
+        "pol": session["pol"],
+        "mi": mi,
+        "off": off,
+        "mem": [list(pair) for pair in zip(session["inos"],
+                                           session["ends"])],
+    }, separators=(",", ":"))
+
+
+def _decode_cursor(cursor):
+    """Parse and validate a cursor string; corrupt content is a ValueError."""
+    try:
+        data = json.loads(cursor)
+    except ValueError as exc:
+        raise ValueError(f"cursor is not parseable: {exc}") from exc
+    try:
+        if not isinstance(data, dict) or data["v"] != _CURSOR_VERSION:
+            raise ValueError("cursor is not parseable")
+        token = data["tok"]
+        pol = data["pol"]
+        mi = data["mi"]
+        off = data["off"]
+        mem = data["mem"]
+        if not isinstance(token, str) or pol not in (0, 1):
+            raise ValueError("cursor is not parseable")
+        for value in (mi, off):
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                raise ValueError("cursor is not parseable")
+        if not isinstance(mem, list):
+            raise ValueError("cursor is not parseable")
+        parsed = []
+        for entry in mem:
+            if not isinstance(entry, list) or len(entry) != 2:
+                raise ValueError("cursor is not parseable")
+            ino, end = entry
+            for value in (ino, end):
+                if not isinstance(value, int) or isinstance(value, bool) \
+                        or value < 0:
+                    raise ValueError("cursor is not parseable")
+            parsed.append((ino, end))
+        if mi >= len(parsed) or off > parsed[mi][1]:
+            raise ValueError("cursor is not parseable")
+    except (KeyError, TypeError) as exc:
+        raise ValueError("cursor is not parseable") from exc
+    return {"tok": token, "pol": pol, "mi": mi, "off": off, "mem": parsed}
+
+
+def _reopen_stream_session(paths, state, quiesce):
+    """Rebuild a session from a persisted cursor (e.g. another process).
+
+    Every member is reopened by path and must still resolve to the
+    inode the cursor pinned; a member that vanished, became unreadable
+    or was replaced under the cursor raises FileNotFoundError.
+    """
+    fds = []
+    try:
+        inos = []
+        for path, (ino, _end) in zip(paths, state["mem"]):
+            try:
+                fd = _open_path_wait(path, quiesce)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"linked stream member missing: {path!r}"
+                )
+            except OSError as exc:
+                raise FileNotFoundError(
+                    f"linked stream member unreadable: {path!r}: {exc}"
+                ) from exc
+            if os.fstat(fd.fileno()).st_ino != ino:
+                fd.close()
+                raise FileNotFoundError(
+                    f"linked stream member replaced under cursor: {path!r}"
+                )
+            fds.append(fd)
+            inos.append(ino)
+    except BaseException:
+        for fd in fds:
+            fd.close()
+        raise
+    return {
+        "fds": fds,
+        "ends": [end for _ino, end in state["mem"]],
+        "inos": inos,
+        "pol": state["pol"],
+    }
+
+
+def _stream_emit(session, paths, mi, off, batch_records, quiesce):
+    """One batch: up to *batch_records* records, never straddling a member."""
+    records = []
+    fds = session["fds"]
+    ends = session["ends"]
+    pol = session["pol"]
+    total = len(paths)
+    while mi < total and len(records) < batch_records:
+        _probe_stream_member(paths[mi], quiesce)
+        fd = fds[mi]
+        end = ends[mi]
+        fd.seek(off)
+        while len(records) < batch_records and off < end:
+            line = fd.readline(end - off)
+            if not line:
+                off = end
+                break
+            if not line.endswith(b"\n"):
+                # A record caught mid-append at the snapshot instant is
+                # excluded, exactly like the one-shot read.
+                off = end
+                break
+            off += len(line)
+            rec = loads(line)
+            if pol:
+                rec = migrate(rec, CURRENT_VERSION)
+            records.append(rec)
+        if off >= end:
+            try:
+                fd.close()
+            finally:
+                fds[mi] = None
+            mi += 1
+            off = 0
+            if records:
+                # Batches are member-aligned: an empty member is
+                # skipped over, but a member that contributed records
+                # ends the batch at its boundary.
+                break
+    return records, mi, off
+
+
+def read_linked_logs_stream(groups, cursor=None, batch_records=4096, *,
+                            batch_size=None, quiesce=DEFAULT_QUIESCE):
+    """Read all groups' current content in cursor-resumable batches.
+
+    Returns ``(records, next_cursor)``: a batch of at most
+    *batch_records* decoded records -- never straddling a member, so
+    batches advance strictly in group, member and line order -- and an
+    opaque string cursor for the next call.  When the snapshot is
+    exhausted the batch may be smaller (or empty) and *next_cursor* is
+    ``None``.  Concatenating every batch reproduces exactly what
+    :func:`read_linked_logs` returns for the same groups (flattened in
+    group, member and line order): the snapshot is pinned at the first
+    call, so no batch repeats or loses records and old/new field shapes
+    never mix -- including while appenders keep writing and a
+    path-reopening appender lands old-format records after a
+    migration's wrap-up.  Members are read line by line; no group is
+    ever loaded into memory wholesale.
+
+    The cursor is a plain string and may be persisted between calls.
+    A cursor that is not a string raises :class:`TypeError`; a string
+    whose content is corrupt raises :class:`ValueError`; a cursor whose
+    current member is missing or unreadable raises
+    :class:`FileNotFoundError` (batches already returned are
+    unaffected).  The group list is validated exactly like
+    :func:`migrate_linked_logs`.  *batch_size* is accepted as an alias
+    of *batch_records*.
+    """
+    groups = _normalize_groups(groups)
+    paths = [path for group in groups for path in group]
+    if batch_size is not None:
+        batch_records = batch_size
+    if isinstance(batch_records, bool) \
+            or not isinstance(batch_records, int):
+        raise TypeError("batch_records must be an integer")
+    if batch_records < 1:
+        raise ValueError("batch_records must be positive")
+    if cursor is not None and not isinstance(cursor, str):
+        raise TypeError("cursor must be a string or None")
+
+    if cursor is None:
+        _probe_members(paths)
+        fds, ends, posts = _open_stream_session(paths, quiesce)
+        session = {
+            "fds": fds,
+            "ends": ends,
+            "inos": [os.fstat(fd.fileno()).st_ino for fd in fds],
+            "pol": _stream_policy(fds, ends, posts),
+        }
+        token = f"{os.getpid()}-{next(_STREAM_TOKENS)}"
+        with _STREAM_LOCK:
+            _STREAM_SESSIONS[token] = session
+        mi = off = 0
+    else:
+        state = _decode_cursor(cursor)
+        if len(state["mem"]) != len(paths):
+            raise ValueError("cursor does not match the group list")
+        token = state["tok"]
+        with _STREAM_LOCK:
+            session = _STREAM_SESSIONS.get(token)
+        if session is None:
+            session = _reopen_stream_session(paths, state, quiesce)
+            with _STREAM_LOCK:
+                _STREAM_SESSIONS[token] = session
+        mi, off = state["mi"], state["off"]
+
+    try:
+        records, mi, off = _stream_emit(
+            session, paths, mi, off, batch_records, quiesce
+        )
+    except BaseException:
+        _drop_stream_session(token)
+        raise
+    if mi >= len(paths):
+        _drop_stream_session(token)
+        return records, None
+    return records, _encode_cursor(token, session, mi, off)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1474,6 +2209,9 @@ def run_linked_cli(argv):
     except (LinkedBadReferenceError, BadRecordError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BAD_RECORD
+    except MigrationLockedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     except (TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE

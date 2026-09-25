@@ -284,7 +284,9 @@ follow the `--group` order).
 Python entry points:
 
 ```python
-from proto_migrate import migrate_linked_logs, read_linked_logs
+from proto_migrate import (
+    migrate_linked_logs, read_linked_logs, read_linked_logs_stream,
+)
 
 result = migrate_linked_logs(
     [["orders.log"], ["details.log"]],
@@ -296,6 +298,13 @@ result = migrate_linked_logs(
 
 snapshot = read_linked_logs([["orders.log"], ["details.log"]])
 # one flat record list per group, version-consistent across all groups
+
+batch, cursor = read_linked_logs_stream([["orders.log"], ["details.log"]],
+                                        None, batch_records=1000)
+while cursor is not None:
+    batch, cursor = read_linked_logs_stream(
+        [["orders.log"], ["details.log"]], cursor, batch_records=1000)
+# the same snapshot, in cursor-resumable batches
 ```
 
 The group list must be a non-empty sequence of non-empty member
@@ -319,7 +328,10 @@ unsupported).
   (groups in list order, members in list order, lines in file order)
   raises `LinkedBadReferenceError` / `GroupBadRecordError` (both
   `ValueError`) before any rename; every original stays untouched, exit
-  code `3`.
+  code `3`.  Bad lines and bad references are compared in that global
+  order and the earliest one decides which exception is raised, so a
+  bad reference that sorts before a later member's bad line is reported
+  first.
 - `--skip`: bad lines are skipped with the usual audit entry, and
   records holding bad references are dropped from the migrated output;
   each dropped record is audited to **stderr** as
@@ -332,28 +344,69 @@ Migration output uses the unchanged encoding, field defaults and drop
 rules; the `-0.0` / non-finite amount semantics are exactly the
 single-file ones.
 
+### Multi-instance coordination
+
+Several migration instances may run concurrently, over overlapping or
+disjoint group sets.  Every member is held under a non-blocking
+**lease** — an exclusive `flock` on its `<path>.migrate.lock` file, the
+same lock the single-file and single-group migrators wait on — so
+overlapping members are mutually exclusive while disjoint group sets
+advance in parallel (each group set owns a distinct
+`.migrate-linked-tmp-<hash>` work directory next to its first member;
+the hash covers the member lists, the policy and link set stay in the
+manifest).  A lease held by a live instance raises
+`MigrationLockedError` (CLI exit `1`) instead of waiting; a holder that
+finishes or disappears — however abruptly — releases its leases via the
+OS, and the next instance reclaims them and takes over from the durable
+checkpoints without rescanning prepared members.  Takeover and resume
+leave no partial migration shape: the outcome is byte-for-byte
+identical to running the same instances serially.  Lease and index
+state lives only in local files and can always be rebuilt.
+
 ### Durability, resume and snapshots
 
 Every member is prepared with the same fsynced segments and durable
 checkpoints as a single-group run, plus a durable per-line index
 classifying every consumed source line.  Reference resolution is
 streaming with bounded memory: keys and edges live in an SQLite spill
-file inside the group work directory (`.migrate-linked-tmp/` next to
-the first group's first member), never loading a whole group into
-memory.  The group commit marker `linked-committed` is the single
+file inside the group work directory (`.migrate-linked-tmp-<hash>/`
+next to the first group's first member), never loading a whole group
+into memory.  The group commit marker `linked-committed` is the single
 success/failure border — published only after every member's rename
 landed — and a kill at any point reruns deterministically: without the
 marker every member is rolled back byte-for-byte (prepared members
 resume from their checkpoints and line indexes without rescanning),
-with it the remaining renames are completed forward.  The result is
-byte-for-byte identical to one uninterrupted run, and durability or
-cleanup failures after the marker are warnings (exit `0`), never
-failures.
+with it the remaining renames are completed forward.  A recovery run
+that finds the marker **converges appends still living on a member's
+backup inode before the backup is removed**, so no record appended
+across the crash is lost.  The result is byte-for-byte identical to one
+uninterrupted run, and durability or cleanup failures after the marker
+are warnings (exit `0`), never failures.
 
 `read_linked_logs` returns one consistent snapshot of all groups in a
 single call: old and new field shapes never mix between groups, between
 members or inside a member — including while a path-reopening appender
 writes old-format records during wrap-up.
+
+### Streaming snapshots: `read_linked_logs_stream`
+
+`read_linked_logs_stream(groups, cursor=None, batch_records=4096)`
+serves the same version-consistent snapshot as `read_linked_logs`, but
+in cursor-resumable batches.  Each call returns
+`(records, next_cursor)`: up to `batch_records` decoded records —
+member-aligned, advancing strictly in group, member and line order —
+plus an opaque string cursor; `next_cursor` is `None` when the snapshot
+is exhausted.  Concatenating all batches reproduces the one-shot read
+exactly.  The snapshot is pinned at the first call (every member's
+inode is held open and its length frozen), so no batch repeats or loses
+records and old/new field shapes never mix, even with appenders writing
+throughout.  Members are read line by line — no group is ever loaded
+into memory wholesale.  The cursor is a plain string and may be
+persisted between calls (including across processes, while the pinned
+inodes still resolve by path).  A non-string cursor raises `TypeError`,
+corrupt cursor content raises `ValueError`, and a cursor whose current
+member is missing or unreadable raises `FileNotFoundError` — batches
+already returned are unaffected.
 
 ## Tests
 
@@ -362,7 +415,13 @@ writes old-format records during wrap-up.
 The migration tests cover three-way concurrency (migrator + appender +
 reader), resume from checkpoints, checkpoint corruption / missing
 segment / torn-tail rollback, real `SIGKILL` crash injection and
-recovery, post-commit fault classification, and idempotent reruns.
+recovery, post-commit fault classification, and idempotent reruns.  The
+linked-migration tests additionally cover the streaming snapshot cursor
+(batched reads equal to the one-shot read, cursor persistence, the
+TypeError/ValueError/FileNotFoundError taxonomy), multi-instance leases
+(mutual exclusion on overlapping members, parallel disjoint instances,
+crash takeover), the strict-mode global first-error ordering, and
+post-commit-crash backup convergence.
 
 ## Public interface
 
@@ -373,8 +432,9 @@ recovery, post-commit fault classification, and idempotent reruns.
 - `proto_migrate.read_log(path) -> list[dict]` returns one version-consistent snapshot of a migrating log.
 - `proto_migrate.migrate_log_group(paths, ...) -> GroupMigrationResult` migrates an explicit group of logs as one all-or-nothing unit.
 - `proto_migrate.read_log_group(paths) -> list[dict]` returns one version-consistent snapshot of a whole group.
-- `proto_migrate.migrate_linked_logs(groups, links=..., ...) -> LinkedMigrationResult` migrates several groups with cross-group reference integrity as one all-or-nothing unit.
+- `proto_migrate.migrate_linked_logs(groups, links=..., ...) -> LinkedMigrationResult` migrates several groups with cross-group reference integrity as one all-or-nothing unit; raises `MigrationLockedError` while a needed member lease is held by a live instance.
 - `proto_migrate.read_linked_logs(groups) -> list[list[dict]]` returns one version-consistent snapshot across all linked groups.
+- `proto_migrate.read_linked_logs_stream(groups, cursor=None, batch_records=...) -> (list[dict], str | None)` returns the same snapshot in cursor-resumable, member-aligned batches.
 - `proto_migrate.VERSIONS -> tuple[int, ...]` supported versions, ascending.
 - `proto_migrate.CURRENT_VERSION -> int` the version `dumps` writes.
 

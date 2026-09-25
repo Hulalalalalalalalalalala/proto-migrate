@@ -577,12 +577,17 @@ def _available_lines(fd, off):
 
 
 def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
-              audit_stream, on_bad):
+              audit_stream, on_bad, extra_gens=()):
     """Drain appenders across the commit.
 
     Returns ``(salvaged, skipped, lineno, warning)``.  A repair I/O
     failure after the commit is reported as a warning, never a failure
     of the already-committed migration.
+
+    *extra_gens* is an optional sequence of ``(fd, offset)`` pairs for
+    unlinked generations *older* than *src* (for example a live inode
+    replaced by a post-commit salvage rewrite): their remaining bytes
+    are drained first, in list order, before *src*'s.
 
     Ordering model: every inode created by one of our renames is one
     *generation*.  A whole-record write lands on the inode the writer's
@@ -622,13 +627,14 @@ def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
     base_size = os.path.getsize(path)
     tail_tmp = os.path.join(tmp_dir, "tail-final")
 
-    # One entry per unlinked generation still tracked:
+    # One entry per unlinked generation still tracked, oldest first:
     # [fd, consumed-offset-in-that-inode, migrated-byte-buffer].
-    # The source inode is generation 0; its consumed offset is the
-    # drain offset handed over from the commit phase, and its buffer
-    # starts empty (the records drained before the commit are already
-    # in the immutable base).
-    gens = [[src, offset, bytearray()]]
+    # The source inode is the youngest tracked generation; its consumed
+    # offset is the drain offset handed over from the commit phase, and
+    # its buffer starts empty (the records drained before the commit are
+    # already in the immutable base).
+    gens = [[fd, off, bytearray()] for fd, off in extra_gens]
+    gens.append([src, offset, bytearray()])
     extra_fds = []
     # Physical size of the rebuilt suffix at the time of the most recent
     # replacement -- exactly where live appends on the current inode

@@ -33,9 +33,11 @@ __all__ = [
     "read_log_group",
     "migrate_linked_logs",
     "read_linked_logs",
+    "read_linked_logs_stream",
     "BadRecordError",
     "GroupBadRecordError",
     "LinkedBadReferenceError",
+    "MigrationLockedError",
     "GroupMigrationResult",
     "LinkedMigrationResult",
     "MigrationResult",
@@ -187,7 +189,9 @@ from .group_migration import (  # noqa: E402
 from .linked_migration import (  # noqa: E402
     LinkedBadReferenceError,
     LinkedMigrationResult,
+    MigrationLockedError,
     migrate_linked_logs,
     read_linked_logs,
+    read_linked_logs_stream,
     run_linked_cli,
 )

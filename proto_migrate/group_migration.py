@@ -406,7 +406,7 @@ def _resume_prepared(path, member_dir, on_bad):
 
 
 def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
-                    audit_stream, line_index=None):
+                    audit_stream, line_index=None, defer_bad=False):
     """Scan one member to a durable ``final`` (or prove it is canonical).
 
     When *line_index* is given (the linked-group migration) every
@@ -414,6 +414,13 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
     projection of the link-involved fields -- and the index is fsynced
     before each checkpoint record so a checkpoint never covers lines
     the index has not durably classified.
+
+    When *defer_bad* is true (strict mode of the linked-group
+    migration), a bad line does not raise: it is recorded in the line
+    index like a skipped line -- but never audited -- so the caller can
+    compare every member's first bad line against the first bad
+    reference and report the globally first problem.  The run aborts
+    before any rename either way, so the deferred output is discarded.
     """
     current_inode = os.stat(path).st_ino
     state = _prepare_workdir(
@@ -443,9 +450,11 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
             try:
                 out, bad = _emit(audit_stream, on_bad, raw, lineno)
             except BadRecordError as exc:
-                raise GroupBadRecordError(
-                    path, exc.lineno, exc.raw, exc.cause
-                ) from exc
+                if not defer_bad:
+                    raise GroupBadRecordError(
+                        path, exc.lineno, exc.raw, exc.cause
+                    ) from exc
+                out, bad = None, True
             if bad:
                 skipped += 1
                 dirty = True
@@ -519,9 +528,11 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
                 try:
                     out, bad = _emit(audit_stream, on_bad, raw, lineno)
                 except BadRecordError as exc:
-                    raise GroupBadRecordError(
-                        path, exc.lineno, exc.raw, exc.cause
-                    ) from exc
+                    if not defer_bad:
+                        raise GroupBadRecordError(
+                            path, exc.lineno, exc.raw, exc.cause
+                        ) from exc
+                    out, bad = None, True
                 if bad:
                     skipped += 1
                     if line_index is not None:
