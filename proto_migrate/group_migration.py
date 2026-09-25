@@ -88,9 +88,11 @@ from .log_migration import (
     EXIT_ERROR,
     EXIT_OK,
     EXIT_USAGE,
+    LINE_GOOD,
     BadRecordError,
     MigrationResult,
     _assemble,
+    _classify_bad_line,
     _commit_marker_path,
     _complete_lines,
     _converge,
@@ -404,8 +406,15 @@ def _resume_prepared(path, member_dir, on_bad):
 
 
 def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
-                    audit_stream):
-    """Scan one member to a durable ``final`` (or prove it is canonical)."""
+                    audit_stream, line_index=None):
+    """Scan one member to a durable ``final`` (or prove it is canonical).
+
+    When *line_index* is given (the linked-group migration) every
+    consumed source line is recorded in it -- offset, kind and a
+    projection of the link-involved fields -- and the index is fsynced
+    before each checkpoint record so a checkpoint never covers lines
+    the index has not durably classified.
+    """
     current_inode = os.stat(path).st_ino
     state = _prepare_workdir(
         path, member_dir, segment_size, current_inode, on_bad
@@ -420,6 +429,8 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
     dirty = state["dirty"]
     lineno = migrated + skipped
     follow_window = max(1.0, quiesce * 20)
+    if line_index is not None:
+        line_index.begin(migrated + skipped, state["resumed"])
 
     src = open(path, "rb")
     try:
@@ -427,6 +438,7 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
         for raw in _read_lines(src, quiesce, offset=offset,
                                follow=follow_window):
             lineno += 1
+            line_start = offset
             offset += len(raw)
             try:
                 out, bad = _emit(audit_stream, on_bad, raw, lineno)
@@ -437,14 +449,21 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
             if bad:
                 skipped += 1
                 dirty = True
+                if line_index is not None:
+                    line_index.record(line_start, _classify_bad_line(raw),
+                                      raw)
                 continue
             if raw != out:
                 dirty = True
+            if line_index is not None:
+                line_index.record(line_start, LINE_GOOD, out)
             writer.write(out)
             migrated += 1
             if writer.size >= writer.limit:
                 name = writer.current_segment
                 writer.close()
+                if line_index is not None:
+                    line_index.sync()
                 _publish_prefix_checkpoint(
                     cp_fh, member_dir, offset, migrated, skipped,
                     dirty, name,
@@ -454,6 +473,8 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
         if writer.has_open_segment:
             name = writer.current_segment
             writer.close()
+            if line_index is not None:
+                line_index.sync()
             _publish_prefix_checkpoint(
                 cp_fh, member_dir, offset, migrated, skipped, dirty,
                 name, os.path.getsize(os.path.join(member_dir, name)),
@@ -462,12 +483,17 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
         writer.abort()
         cp_fh.close()
         src.close()
+        if line_index is not None:
+            line_index.close()
         raise
     writer.abort()
     cp_fh.close()
 
     if not dirty:
         # Canonical member (and nothing skipped): it is never renamed.
+        if line_index is not None:
+            line_index.sync()
+            line_index.close()
         _write_prepared(member_dir, {
             "dirty": False, "offset": offset, "lineno": lineno,
             "migrated": migrated, "skipped": skipped,
@@ -488,6 +514,7 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
             for raw in _read_lines(src, quiesce, offset=offset,
                                    follow=follow_window):
                 lineno += 1
+                line_start = offset
                 offset += len(raw)
                 try:
                     out, bad = _emit(audit_stream, on_bad, raw, lineno)
@@ -497,15 +524,25 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
                     ) from exc
                 if bad:
                     skipped += 1
+                    if line_index is not None:
+                        line_index.record(line_start,
+                                          _classify_bad_line(raw), raw)
                     continue
+                if line_index is not None:
+                    line_index.record(line_start, LINE_GOOD, out)
                 out_fh.write(out)
                 migrated += 1
             out_fh.flush()
             os.fsync(out_fh.fileno())
     except BaseException:
         src.close()
+        if line_index is not None:
+            line_index.close()
         raise
 
+    if line_index is not None:
+        line_index.sync()
+        line_index.close()
     _write_prepared(member_dir, {
         "dirty": True, "offset": offset, "lineno": lineno,
         "migrated": migrated, "skipped": skipped,

@@ -85,13 +85,14 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import shutil
 import sys
 import time
 from typing import NamedTuple
 
-from . import CURRENT_VERSION, dumps, loads, migrate
+from . import CURRENT_VERSION, VERSIONS, dumps, loads, migrate
 
 __all__ = [
     "BadRecordError",
@@ -230,6 +231,42 @@ def _convert(raw):
 def _audit_line(lineno, raw):
     line = raw[:-1] if raw.endswith(b"\n") else raw
     return str(lineno).encode("ascii") + b":" + line[:_AUDIT_SNIPPET] + b"\n"
+
+
+# Line kinds recorded by group_migration._prepare_member when the caller
+# (the linked-group migration) keeps a durable per-line index of every
+# consumed source line, so a rerun can reclassify lines without
+# rescanning the source.
+LINE_GOOD = 0          # decoded and migrated normally
+LINE_SKIPPED = 1       # bad record skipped under on_bad="skip"
+LINE_BAD_VERSION = 2   # skipped because the version key itself is illegal
+
+
+def _reject_json_constant(_value):
+    raise ValueError("non-JSON constant")
+
+
+def _classify_bad_line(raw):
+    """Classify a skipped bad line for the linked-group line index.
+
+    Returns LINE_BAD_VERSION when the payload is a JSON object whose
+    version key is missing, non-integer or unsupported (the record's
+    remaining fields may still identify it as a reference target);
+    LINE_SKIPPED for every other failure.
+    """
+    try:
+        obj = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
+    except (UnicodeDecodeError, ValueError):
+        return LINE_SKIPPED
+    if not isinstance(obj, dict):
+        return LINE_SKIPPED
+    version = obj.get("v")
+    if not (isinstance(version, int) and not isinstance(version, bool)) \
+            or version not in VERSIONS:
+        return LINE_BAD_VERSION
+    return LINE_SKIPPED
 
 
 def _emit(audit_stream, on_bad, raw, lineno):

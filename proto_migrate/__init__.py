@@ -31,12 +31,17 @@ __all__ = [
     "read_log",
     "migrate_log_group",
     "read_log_group",
+    "migrate_linked_logs",
+    "read_linked_logs",
     "BadRecordError",
     "GroupBadRecordError",
+    "LinkedBadReferenceError",
     "GroupMigrationResult",
+    "LinkedMigrationResult",
     "MigrationResult",
     "run_cli",
     "run_group_cli",
+    "run_linked_cli",
 ]
 
 VERSIONS = (1, 2, 3)
@@ -178,4 +183,11 @@ from .group_migration import (  # noqa: E402
     migrate_log_group,
     read_log_group,
     run_group_cli,
+)
+from .linked_migration import (  # noqa: E402
+    LinkedBadReferenceError,
+    LinkedMigrationResult,
+    migrate_linked_logs,
+    read_linked_logs,
+    run_linked_cli,
 )

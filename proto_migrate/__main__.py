@@ -6,6 +6,7 @@ import sys
 
 from . import CURRENT_VERSION, VERSIONS, dumps, loads, migrate, run_cli
 from .group_migration import run_group_cli
+from .linked_migration import run_linked_cli
 
 
 def _selftest():
@@ -94,11 +95,16 @@ def main(argv=None):
         return run_cli(args[1:])
     if args and args[0] == "migrate-logs":
         return run_group_cli(args[1:])
+    if args and args[0] == "migrate-linked-logs":
+        return run_linked_cli(args[1:])
     print(
         "usage: python3 -m proto_migrate --selftest\n"
         "       python3 -m proto_migrate migrate-log FILE [--strict|--skip]\n"
         "       python3 -m proto_migrate migrate-logs FILE [FILE ...] "
-        "[--strict|--skip]",
+        "[--strict|--skip]\n"
+        "       python3 -m proto_migrate migrate-linked-logs "
+        "--group FILE [FILE ...] [--group ...] "
+        "[--link SRC:DST:SRC_FIELD:DST_FIELD] [--strict|--skip]",
         file=sys.stderr,
     )
     return 2
