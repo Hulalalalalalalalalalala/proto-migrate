@@ -749,6 +749,251 @@ def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
     return salvaged_records, skipped_box[0], lineno_box[0], warning
 
 
+# ---------------------------------------------------------------------------
+# Post-commit backup recovery
+# ---------------------------------------------------------------------------
+#
+# The group/linked protocols rename the original inode aside as
+# ``<path>...backup`` while phase 2 converges appenders and only then
+# delete it.  A kill after the commit marker but before that deletion
+# leaves whole appended records stranded on the backup inode.  A rerun
+# must fold them into the live migrated file *before* removing the
+# backup, with no loss, no duplication and in the exact order an
+# uninterrupted run would have produced.
+#
+# ``_converge`` rebuilds the live file as
+#
+#     <staged base F> + G0 + G1 + ... + current tail
+#
+# where G0 is the cumulative buffer of records drained from the source
+# (now backup) inode and every later G* comes from a younger inode
+# generation.  G0 is therefore a *contiguous prefix* of the live suffix,
+# grows only by appending, and migration is deterministic -- so the
+# fold boundary is recoverable from file contents alone:
+#
+#   1. converting the backup's complete lines through the recorded
+#      drain-end offset reproduces F byte for byte (the live file must
+#      start with it; otherwise the backup is left untouched);
+#   2. the remaining converted backup records are matched one by one
+#      against the live suffix *from its first line* -- the first
+#      mismatch is exactly how far the killed convergence had folded G0
+#      (a younger-generation record that merely shares the same bytes
+#      can only sit past that boundary and so cannot fool a strict
+#      prefix match);
+#   3. the rebuild writes F + matched prefix + every not-yet-folded
+#      backup record + the younger-generation suffix bytes, restoring
+#      the serial generation order.  A later rerun is a fixed point:
+#      every backup record then matches the prefix and nothing is
+#      rewritten.
+#
+# A backup whose drain point cannot be established, whose base does not
+# match, or which still holds a record mid-append is *retained* (and a
+# warning returned) rather than risking a lost or duplicated record:
+# post-border faults are never failures.
+
+
+def _recover_backup_appends(path, backup_path, offset, on_bad, quiesce,
+                            audit_stream, base_size=None,
+                            filtered=False):
+    """Fold a surviving committed backup's appends into the live file.
+
+    *offset* is the source-byte offset the killed run had drained
+    through before staging (always a line boundary).  *base_size* is the
+    staged-output length recorded durably right before staging: the live
+    file starts with exactly those bytes.  *filtered_base* (the linked
+    skip-mode case) says some good base-region records were dropped from
+    the staged output, so converted base lines are aligned against
+    ``live[:base_size]`` as an order-preserving subsequence; otherwise
+    every converted base line must appear.
+
+    Returns ``(appended, skipped, retain, warning)``: *appended* records
+    were newly moved by this call (zero on an idempotent rerun),
+    *skipped* counts bad post-drain lines newly audited, *retain* means
+    the backup (and the member work directory) must be kept for another
+    rerun -- it is set for a torn tail or any warning.
+    """
+    try:
+        backup = open(backup_path, "rb")
+    except OSError as exc:
+        return 0, 0, True, (
+            f"cannot open surviving backup {backup_path!r}: {exc}"
+        )
+
+    try:
+        # Two quiet probes delimit a record whose single whole-record
+        # write may still be in flight; re-read on any growth so a
+        # straddle write is never classified as a complete line.
+        backup.seek(0)
+        blob = backup.read()
+        time.sleep(quiesce)
+        backup.seek(0)
+        blob2 = backup.read()
+        if blob2 != blob:
+            time.sleep(quiesce)
+            backup.seek(0)
+            blob2 = backup.read()
+        blob = blob2
+        torn = bool(blob) and not blob.endswith(b"\n")
+
+        base_lines = []   # converted records of the staged base, in order
+        tail_records = []  # backup-origin records past the drain point
+        pos = 0
+        lineno0 = 0
+        skipped = 0
+        for raw in blob.splitlines(keepends=True):
+            end = pos + len(raw)
+            in_base = end <= offset
+            if not raw.endswith(b"\n"):
+                break
+            try:
+                out = _convert(raw)
+            except ValueError as exc:
+                if on_bad == "strict":
+                    return 0, skipped, True, (
+                        f"bad record on surviving backup at source line "
+                        f"{lineno0 + 1}; backup retained, rerun with "
+                        f"--skip to finish: {exc}"
+                    )
+                if not in_base:
+                    # Base-region skips were audited before the border;
+                    # only post-drain ones are newly audited here.
+                    audit_stream.write(_audit_line(lineno0 + 1, raw))
+                    audit_stream.flush()
+                    skipped += 1
+                pos = end
+                lineno0 += 1
+                continue
+            if in_base:
+                base_lines.append(out)
+            else:
+                tail_records.append(out)
+            pos = end
+            lineno0 += 1
+
+        if pos < offset:
+            return (0, skipped, True,
+                    "surviving backup is shorter than the recorded drain "
+                    "point; backup retained for manual inspection")
+
+        with open(path, "rb") as live_fh:
+            live = live_fh.read()
+        if base_size is None:
+            base_size = sum(len(line) for line in base_lines)
+        if base_size > len(live):
+            return (0, skipped, True,
+                    "live file is shorter than the recorded staged base; "
+                    "backup retained for manual inspection")
+        staged = live[:base_size]
+        suffix = live[base_size:]
+
+        # Verify the converted base matches the staged bytes.  A
+        # filtered base (linked skip mode drops bad-reference records)
+        # omits base lines, so the staged lines must form an
+        # order-preserving subsequence of the converted base; otherwise
+        # the two must be identical line for line.
+        staged_lines = staged.splitlines(keepends=True)
+        if filtered:
+            bi = 0
+            for line in staged_lines:
+                found = -1
+                for j in range(bi, len(base_lines)):
+                    if base_lines[j] == line:
+                        found = j
+                        break
+                if found < 0:
+                    return (0, skipped, True,
+                            "staged base is not a subsequence of the "
+                            "surviving backup; backup retained for manual "
+                            "inspection")
+                bi = found + 1
+        else:
+            if len(staged_lines) != len(base_lines) or any(
+                    a != b for a, b in zip(staged_lines, base_lines)):
+                return (0, skipped, True,
+                        "live file no longer starts with the staged "
+                        "base; backup retained for manual inspection")
+
+        # Strict prefix match of the backup-origin tail against the live
+        # suffix: the first line that differs is the exact fold boundary.
+        suffix_lines = suffix.splitlines(keepends=True)
+        matched = 0
+        matched_bytes = 0
+        for line in suffix_lines:
+            if matched < len(tail_records) and line == tail_records[matched]:
+                matched += 1
+                matched_bytes += len(line)
+            else:
+                break
+        younger = suffix[matched_bytes:]
+        leftover = tail_records[matched:]
+
+        warning = None
+        if torn:
+            warning = (
+                "record still being appended to the surviving backup; "
+                "the backup is retained, rerun to finish the last record"
+            )
+        if leftover:
+            tail_tmp = backup_path + ".rebuild-tmp"
+            with open(tail_tmp, "wb") as out_fh:
+                out_fh.write(staged)
+                out_fh.write(suffix[:matched_bytes])
+                for out in leftover:
+                    out_fh.write(out)
+                out_fh.write(younger)
+                out_fh.flush()
+                os.fsync(out_fh.fileno())
+            os.replace(tail_tmp, path)
+            _fsync_dir(os.path.dirname(os.path.abspath(path)))
+        return len(leftover), skipped, bool(torn), warning
+    except OSError as exc:
+        return 0, 0, True, (
+            f"backup recovery failed, backup retained: {exc}"
+        )
+    finally:
+        backup.close()
+
+
+# Sidecar recording, right before a member is staged, everything a
+# committed-run recovery needs to fold appends stranded on the backup:
+# the staged output size, the source drain-end offset/line count, the
+# bad-record policy and the source inode.  Published into the member
+# work directory (temp file + fsync + rename + directory fsync) so it is
+# either fully present or absent; consumed (deleted) only once the
+# backup itself is gone.
+
+_STAGE_SIDECAR = "stage.json"
+
+
+def _write_stage_sidecar(member_dir, info):
+    path = os.path.join(member_dir, _STAGE_SIDECAR)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(json.dumps(info).encode("ascii"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(member_dir)
+
+
+def _read_stage_sidecar(member_dir):
+    try:
+        with open(os.path.join(member_dir, _STAGE_SIDECAR), "rb") as f:
+            data = json.loads(f.read())
+        info = {
+            "staged_size": int(data["staged_size"]),
+            "offset": int(data["offset"]),
+            "lineno": int(data["lineno"]),
+            "mode": str(data["mode"]),
+            "inode": int(data["inode"]),
+        }
+        if "filtered" in data:
+            info["filtered"] = bool(data["filtered"])
+        return info
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE,
                      quiesce=DEFAULT_QUIESCE, audit=None):
     """Migrate a JSONL log file in place to the current record version.

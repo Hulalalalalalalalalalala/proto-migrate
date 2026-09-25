@@ -355,6 +355,91 @@ single call: old and new field shapes never mix between groups, between
 members or inside a member — including while a path-reopening appender
 writes old-format records during wrap-up.
 
+### Cursor-based streaming snapshots
+
+`read_linked_logs_stream` is the batched, resumable companion of
+`read_linked_logs`: it returns the same current content of every group
+in group order, member order and line order, one bounded batch at a
+time, without ever loading a whole member (let alone a group) into
+memory.
+
+```python
+from proto_migrate import read_linked_logs_stream
+
+cursor = None
+while True:
+    batch = read_linked_logs_stream(groups, cursor, batch_size=500)
+    for record in batch.records:
+        ...  # group order, member order, line order
+    if batch.done:
+        break
+    cursor = batch.next_cursor          # persists across calls
+```
+
+The first call (cursor `None`) pins the snapshot; the opaque string
+cursor returned with each batch resumes the next call exactly where the
+previous one ended. The concatenation of all batches is identical to
+one one-shot `read_linked_logs` at pin time: no record is repeated or
+dropped, old and new field shapes never mix between or within groups,
+references never dangle at a half-record, and a path-reopening appender
+during migration wrap-up still presents one version shape. Records
+appended after the pin do not move the frozen view; a torn tail (no
+terminating newline) is excluded.
+
+- a cursor that is not a string raises `TypeError`;
+- a cursor whose contents are corrupt or unparseable, or which was
+  opened for a different group list, raises `ValueError`;
+- the member the cursor currently points at being missing or
+  unreadable raises `FileNotFoundError`; already returned batches stay
+  valid.
+
+### Coordinated multi-instance migrations
+
+Several migration *instances* can run concurrently over overlapping
+group sets. Coordination is entirely local (files and file locks — no
+schema registry, no network):
+
+```python
+from proto_migrate import MigrationSpec, run_coordinated_migrations
+
+run_coordinated_migrations([
+    MigrationSpec([["orders.log"], ["details.log"]],
+                  links=[(1, 0, "order_id", "order_id")], on_bad="skip"),
+    MigrationSpec([["details.log"], ["shipments.log"]],
+                  links=[(1, 0, "order_id", "order_id")], on_bad="skip"),
+])
+```
+
+- **overlapping members are mutually exclusive.** Each member carries a
+  lease (the same `<member>.migrate.lock` file the ordinary migrations
+  lock); an instance acquires every member lease with a non-blocking
+  `flock`. Two instances sharing a member never prepare or rename it at
+  once; disjoint instances hold no common lease and proceed in parallel.
+- **deterministic takeover.** An `flock` is released by the kernel the
+  instant the holder dies (however abruptly), so a preempted or crashed
+  instance's leases are immediately reclaimable. The next attempt
+  resumes the dead run's durable per-member checkpoints and line
+  indexes — prepared members are never rescanned — and finishes
+  byte-for-byte identical to running the same instances serially, with
+  no partially migrated shape left behind.
+- an instance whose member lease is currently held raises
+  `MigrationLockedError`; once the holder is gone the lease is
+  reclaimed and the run takes over. `run_coordinated_migrations` waits
+  (up to `wait_timeout`) and orders overlapping specs deterministically
+  in list order, while disjoint specs still run concurrently.
+- summary counters count only records an invocation newly rewrites: a
+  takeover that merely finishes checkpoints and an idempotent rerun both
+  report zero, with member and group totals consistent.
+- recovery after a commit-border crash first folds appends stranded on
+  the held-aside backup (deterministic prefix reconstruction, including
+  records the killed convergence had already folded) and only then
+  removes the backup, so no appended record is lost.
+
+In strict mode the global first error is decided by group order, member
+order and line order across *both* bad lines and bad references: a bad
+reference that appears earlier is raised before a later bad line, and
+this ordering applies to the linked entry point as well.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
@@ -375,6 +460,10 @@ recovery, post-commit fault classification, and idempotent reruns.
 - `proto_migrate.read_log_group(paths) -> list[dict]` returns one version-consistent snapshot of a whole group.
 - `proto_migrate.migrate_linked_logs(groups, links=..., ...) -> LinkedMigrationResult` migrates several groups with cross-group reference integrity as one all-or-nothing unit.
 - `proto_migrate.read_linked_logs(groups) -> list[list[dict]]` returns one version-consistent snapshot across all linked groups.
+- `proto_migrate.read_linked_logs_stream(groups, cursor=None, *, batch_size=...) -> StreamBatch` returns one bounded batch of the linked snapshot with an opaque resumable cursor.
+- `proto_migrate.MigrationSpec(groups, links=[], on_bad="strict")` describes one coordinated migration instance.
+- `proto_migrate.run_coordinated_migrations(specs, ...) -> tuple[CoordinatedMigrationResult, ...]` runs overlapping instances with member-level mutual exclusion, deterministic takeover and parallel disjoint sets.
+- `proto_migrate.migrate_linked_logs_coordinated(spec, ...) -> CoordinatedMigrationResult` runs one coordinated instance (raises `MigrationLockedError` on a held member).
 - `proto_migrate.VERSIONS -> tuple[int, ...]` supported versions, ascending.
 - `proto_migrate.CURRENT_VERSION -> int` the version `dumps` writes.
 

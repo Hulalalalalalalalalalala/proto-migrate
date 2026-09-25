@@ -82,7 +82,7 @@ import sys
 from collections.abc import Sequence
 from typing import NamedTuple
 
-from . import CURRENT_VERSION, migrate
+from . import CURRENT_VERSION, loads, migrate
 from .log_migration import (
     DEFAULT_QUIESCE,
     DEFAULT_SEGMENT_SIZE,
@@ -98,8 +98,12 @@ from .log_migration import (
     _converge,
     _crash_point,
     _fsync_dir,
+    _read_stage_sidecar,
+    _recover_backup_appends,
+    _write_stage_sidecar,
 )
 from .group_migration import (
+    GroupBadRecordError,
     _AuditPrefix,
     _acquire_member_locks,
     _prepare_member,
@@ -335,7 +339,6 @@ def _read_linked_prepared(member_dir):
     except (OSError, ValueError):
         return None
 
-
 # ---------------------------------------------------------------------------
 # Rename debris reconciliation (crash recovery)
 # ---------------------------------------------------------------------------
@@ -531,12 +534,14 @@ class _LinkedMember:
 
 
 def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
-                           segment_size, quiesce, audit_stream, fields):
+                           segment_size, quiesce, audit_stream, fields,
+                           bad_sink=None):
     """Prepare one member with its durable line index."""
     member = _prepare_member(
         path, member_dir, on_bad, segment_size, quiesce,
         _AuditPrefix(audit_stream, path),
         line_index=_LineIndex(member_dir, fields),
+        bad_sink=bad_sink,
     )
     if _count_line_entries(member_dir) != member.lineno:
         # The line index and the checkpoints disagree (e.g. the index
@@ -554,7 +559,7 @@ def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
         )
     _write_linked_prepared(member_dir, {
         "dirty": member.dirty, "offset": member.offset,
-        "lineno": member.lineno,
+        "lineno": member.lineno, "fields": sorted(fields),
     })
     fresh_from = member.lineno - (member.run_migrated + member.run_skipped)
     return _LinkedMember(
@@ -564,10 +569,21 @@ def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
     )
 
 
-def _resume_linked_prepared(index, group_index, path, member_dir, on_bad):
-    """Fast path: a member fully prepared before the kill is not redone."""
+def _resume_linked_prepared(index, group_index, path, member_dir, on_bad,
+                            fields):
+    """Fast path: a member fully prepared before the kill is not redone.
+
+    The durable line index only projects the link fields of the run
+    that built it; a resume under a link set needing a field that index
+    does not cover re-prepares the member, so reference resolution never
+    reads a missing projection.
+    """
     info = _read_linked_prepared(member_dir)
     if info is None:
+        return None
+    have_fields = set(info.get("fields", ()))
+    if not set(fields) <= have_fields:
+        shutil.rmtree(member_dir, ignore_errors=True)
         return None
     inode, mode, _records, _good = _read_checkpoint_log(member_dir)
     try:
@@ -901,13 +917,24 @@ def _audit_dropped(member, audit_stream):
 # ---------------------------------------------------------------------------
 
 
-def _stage_linked_member(member):
+def _stage_linked_member(member, on_bad):
     """Phase 1: promote this member's output over its path; backup held."""
     path = member.path
     parent = os.path.dirname(os.path.abspath(path))
     d = _linked_debris(path)
     src_name = _LINKED_FINAL if member.dropped else _FINAL
-    os.replace(os.path.join(member.member_dir, src_name), d["staged"])
+    src_path = os.path.join(member.member_dir, src_name)
+    # Durably record how a committed-run recovery must fold appends
+    # stranded on the backup, before any rename makes the backup exist.
+    _write_stage_sidecar(member.member_dir, {
+        "staged_size": os.path.getsize(src_path),
+        "offset": member.offset,
+        "lineno": member.lineno,
+        "mode": on_bad,
+        "inode": os.stat(path).st_ino,
+        "filtered": bool(member.dropped),
+    })
+    os.replace(src_path, d["staged"])
     _publish_member_marker(path)
     os.replace(path, d["backup"])
     os.replace(d["staged"], path)
@@ -990,17 +1017,74 @@ def _finish_committed_linked(paths, group_dir, on_bad,
     warnings = []
     member_results = []
     salvaged_total = skipped_total = migrated_total = 0
+    retained = set()
 
     for path in paths:
         parent = os.path.dirname(os.path.abspath(path))
         d = _linked_debris(path)
-        try:
-            _remove(d["backup"])
-            _fsync_dir(parent)
-        except OSError as exc:
-            warnings.append(f"{path}: backup removal failed: {exc}")
-
         member_dir = _linked_member_dir(path)
+
+        if os.path.exists(d["backup"]):
+            # Fold appends stranded on the killed run's backup before
+            # touching the live path; only then may the backup go.
+            sidecar = _read_stage_sidecar(member_dir)
+            keep = True
+            if sidecar is not None:
+                try:
+                    backup_inode = os.stat(d["backup"]).st_ino
+                except OSError as exc:
+                    backup_inode = None
+                    warnings.append(
+                        f"{path}: cannot stat surviving backup: {exc}"
+                    )
+                if backup_inode is not None:
+                    if sidecar["inode"] != backup_inode \
+                            or sidecar["mode"] != on_bad:
+                        warnings.append(
+                            f"{path}: surviving backup does not match the "
+                            "staging record; backup retained, rerun after "
+                            "inspection"
+                        )
+                    else:
+                        appended, bskip, retain, warning = (
+                            _recover_backup_appends(
+                                path, d["backup"], sidecar["offset"],
+                                on_bad, quiesce,
+                                _AuditPrefix(audit_stream, path),
+                                base_size=sidecar["staged_size"],
+                                filtered=sidecar.get("filtered", False),
+                            )
+                        )
+                        migrated_total += appended
+                        salvaged_total += appended
+                        skipped_total += bskip
+                        if warning:
+                            warnings.append(f"{path}: {warning}")
+                        keep = retain
+            else:
+                warnings.append(
+                    f"{path}: surviving backup without a staging record; "
+                    "backup retained, rerun after inspection"
+                )
+            if keep:
+                retained.add(path)
+                member_results.append(MigrationResult(
+                    path=path, records_migrated=0, records_skipped=0,
+                    records_salvaged=0, replaced=False,
+                ))
+                continue
+            try:
+                _remove(d["backup"])
+                _fsync_dir(parent)
+            except OSError as exc:
+                warnings.append(f"{path}: backup removal failed: {exc}")
+                retained.add(path)
+                member_results.append(MigrationResult(
+                    path=path, records_migrated=0, records_skipped=0,
+                    records_salvaged=0, replaced=False,
+                ))
+                continue
+
         shutil.rmtree(member_dir, ignore_errors=True)
         member_replaced = False
         salvaged = conv_skipped = 0
@@ -1011,6 +1095,14 @@ def _finish_committed_linked(paths, group_dir, on_bad,
             )
             if member.dirty:
                 staged_path = os.path.join(member_dir, _FINAL)
+                _write_stage_sidecar(member_dir, {
+                    "staged_size": os.path.getsize(staged_path),
+                    "offset": member.offset,
+                    "lineno": member.lineno,
+                    "mode": on_bad,
+                    "inode": os.stat(path).st_ino,
+                    "filtered": False,
+                })
                 os.replace(staged_path, path + _STAGED_SUFFIX)
                 _publish_member_marker(path)
                 os.replace(path, path + _BACKUP_SUFFIX)
@@ -1048,10 +1140,15 @@ def _finish_committed_linked(paths, group_dir, on_bad,
             except OSError:
                 pass
 
-    try:
-        _sweep_linked(paths, group_dir)
-    except OSError as exc:
-        warnings.append(f"cleanup failed: {exc}")
+    if retained:
+        for path in paths:
+            if path not in retained:
+                shutil.rmtree(_linked_member_dir(path), ignore_errors=True)
+    else:
+        try:
+            _sweep_linked(paths, group_dir)
+        except OSError as exc:
+            warnings.append(f"cleanup failed: {exc}")
     return migrated_total, skipped_total, salvaged_total, \
         tuple(member_results), warnings
 
@@ -1063,7 +1160,9 @@ def _finish_committed_linked(paths, group_dir, on_bad,
 
 def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                         segment_size=DEFAULT_SEGMENT_SIZE,
-                        quiesce=DEFAULT_QUIESCE, audit=None):
+                        quiesce=DEFAULT_QUIESCE, audit=None,
+                        _group_dir_override=None, _lock_path_override=None,
+                        _member_lock_fhs=None):
     """Migrate linked groups of JSONL logs with referential integrity.
 
     Every group is migrated to the current record version and every
@@ -1099,8 +1198,12 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
 
     audit_stream = audit if audit is not None else sys.stderr.buffer
     first_dir = os.path.dirname(os.path.abspath(groups[0][0]))
-    group_dir = _linked_group_dir(groups)
-    lock_path = os.path.join(first_dir, _LINKED_LOCK_NAME)
+    group_dir = (_group_dir_override
+                 if _group_dir_override is not None
+                 else _linked_group_dir(groups))
+    lock_path = (_lock_path_override
+                 if _lock_path_override is not None
+                 else os.path.join(first_dir, _LINKED_LOCK_NAME))
 
     # Link-involved fields, and per-group source/target link views.
     fields = set()
@@ -1120,7 +1223,15 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
 
     with open(lock_path, "a+b") as group_lock:
         fcntl.flock(group_lock, fcntl.LOCK_EX)
-        member_locks = _acquire_member_locks(paths)
+        if _member_lock_fhs is not None:
+            # Coordinated run: the per-member leases were already
+            # acquired (non-blocking) by the coordinator and stay
+            # owned by it for the whole run.
+            member_locks = list(_member_lock_fhs)
+            owns_member_locks = False
+        else:
+            member_locks = _acquire_member_locks(paths)
+            owns_member_locks = True
         try:
             _crash_point("linked-lock")
 
@@ -1184,20 +1295,48 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                 )
 
             # --- PREPARE every member (resumed via local checkpoints).
+            # In strict mode every member is prepared leniently: bad
+            # lines are collected rather than raised, so after
+            # references are resolved the globally first bad line and
+            # the globally first bad reference can be compared in
+            # group/member/line order -- an earlier bad reference must
+            # be reported ahead of a later bad line.
+            member_bad = {}
             try:
                 index = 0
                 for group_index, group in enumerate(groups):
                     for path in group:
                         member_dir = _linked_member_dir(path)
                         member = _resume_linked_prepared(
-                            index, group_index, path, member_dir, on_bad
+                            index, group_index, path, member_dir, on_bad,
+                            fields,
                         )
                         if member is None:
+                            sink = [] if on_bad == "strict" else None
                             member = _prepare_linked_member(
                                 index, group_index, path, member_dir,
                                 on_bad, segment_size, quiesce,
-                                audit_stream, fields,
+                                audit_stream, fields, bad_sink=sink,
                             )
+                            if sink:
+                                member_bad[index] = sink
+                        elif on_bad == "strict":
+                            # Fast-resumed member: its bad lines survive
+                            # only as line-index kinds; recover the first
+                            # one for the global first-error comparison.
+                            for lineno0, _off, kind, _proj in (
+                                    _stream_line_entries(member_dir)):
+                                if kind != LINE_GOOD:
+                                    raw = _read_source_line(member, lineno0)
+                                    cause = "bad record"
+                                    try:
+                                        loads(raw)
+                                    except ValueError as exc:
+                                        cause = str(exc)
+                                    member_bad[index] = [
+                                        (lineno0 + 1, raw, cause)
+                                    ]
+                                    break
                         members.append(member)
                         index += 1
                 _crash_point("linked-prepare")
@@ -1224,6 +1363,22 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                 finally:
                     refs.close()
 
+                if on_bad == "strict":
+                    first_line = None
+                    for member in members:
+                        sink = member_bad.get(member.index)
+                        if sink:
+                            first_line = (member, sink[0])
+                            break
+                    if first_line is not None and (
+                            first is None
+                            or (first_line[0].index,
+                                first_line[1][0] - 1)
+                            <= (first[0], first[1])):
+                        bad_member, (lineno, raw, cause) = first_line
+                        raise GroupBadRecordError(
+                            bad_member.path, lineno, raw, cause
+                        )
                 if on_bad == "strict" and first is not None:
                     mi, lineno0, reason, link_id, value = first
                     member = members[mi]
@@ -1263,7 +1418,7 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                     staged = []
                     try:
                         for member in staged_members:
-                            _stage_linked_member(member)
+                            _stage_linked_member(member, on_bad)
                             staged.append(member)
                             _crash_point("linked-stage")
                         _crash_point("linked-staged")
@@ -1312,9 +1467,10 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                     member.src.close()
                 except OSError:
                     pass
-            for fh in member_locks:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-                fh.close()
+            if owns_member_locks:
+                for fh in member_locks:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                    fh.close()
 
     totals_migrated = sum(m.run_migrated for m in staged_members)
     totals_skipped = sum(m.run_skipped for m in staged_members)

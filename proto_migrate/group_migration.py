@@ -96,6 +96,7 @@ from .log_migration import (
     _commit_marker_path,
     _complete_lines,
     _converge,
+    _convert,
     _crash_point,
     _emit,
     _fsync_dir,
@@ -103,6 +104,9 @@ from .log_migration import (
     _publish_prefix_checkpoint,
     _read_checkpoint_log,
     _read_lines,
+    _read_stage_sidecar,
+    _recover_backup_appends,
+    _write_stage_sidecar,
 )
 
 __all__ = [
@@ -406,7 +410,7 @@ def _resume_prepared(path, member_dir, on_bad):
 
 
 def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
-                    audit_stream, line_index=None):
+                    audit_stream, line_index=None, bad_sink=None):
     """Scan one member to a durable ``final`` (or prove it is canonical).
 
     When *line_index* is given (the linked-group migration) every
@@ -414,6 +418,13 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
     projection of the link-involved fields -- and the index is fsynced
     before each checkpoint record so a checkpoint never covers lines
     the index has not durably classified.
+
+    When *bad_sink* is given, strict-mode bad lines do not raise: they
+    are recorded in the sink as ``(lineno, raw, cause)`` and handled
+    exactly like skip-mode bad lines.  The linked migration uses this to
+    prepare every member leniently in strict mode, so the globally
+    first bad line and the globally first bad reference can be compared
+    by group/member/line order before either is reported.
     """
     current_inode = os.stat(path).st_ino
     state = _prepare_workdir(
@@ -433,6 +444,22 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
         line_index.begin(migrated + skipped, state["resumed"])
 
     src = open(path, "rb")
+
+    def emit_one(raw_lineno, raw):
+        """Convert one line; with bad_sink, strict bad lines sink not raise."""
+        if bad_sink is not None:
+            try:
+                return _convert(raw), False
+            except ValueError as exc:
+                bad_sink.append((raw_lineno, raw, str(exc)))
+                return None, True
+        try:
+            return _emit(audit_stream, on_bad, raw, raw_lineno)
+        except BadRecordError as exc:
+            raise GroupBadRecordError(
+                path, exc.lineno, exc.raw, exc.cause
+            ) from exc
+
     try:
         # --- SCAN: the same tailing policy as a single-file run.
         for raw in _read_lines(src, quiesce, offset=offset,
@@ -440,12 +467,7 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
             lineno += 1
             line_start = offset
             offset += len(raw)
-            try:
-                out, bad = _emit(audit_stream, on_bad, raw, lineno)
-            except BadRecordError as exc:
-                raise GroupBadRecordError(
-                    path, exc.lineno, exc.raw, exc.cause
-                ) from exc
+            out, bad = emit_one(lineno, raw)
             if bad:
                 skipped += 1
                 dirty = True
@@ -516,12 +538,7 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
                 lineno += 1
                 line_start = offset
                 offset += len(raw)
-                try:
-                    out, bad = _emit(audit_stream, on_bad, raw, lineno)
-                except BadRecordError as exc:
-                    raise GroupBadRecordError(
-                        path, exc.lineno, exc.raw, exc.cause
-                    ) from exc
+                out, bad = emit_one(lineno, raw)
                 if bad:
                     skipped += 1
                     if line_index is not None:
@@ -569,12 +586,23 @@ def _publish_member_marker(path):
     _fsync_dir(parent)
 
 
-def _stage_member(member):
+def _stage_member(member, on_bad):
     """Phase 1: promote this member's final over its path; backup held."""
     path = member.path
     parent = os.path.dirname(os.path.abspath(path))
     d = _debris(path)
-    os.replace(os.path.join(member.member_dir, _FINAL), d["staged"])
+    final = os.path.join(member.member_dir, _FINAL)
+    # Durably record how a committed-run recovery must fold appends
+    # stranded on the backup, before any rename makes the backup exist.
+    _write_stage_sidecar(member.member_dir, {
+        "staged_size": os.path.getsize(final),
+        "offset": member.offset,
+        "lineno": member.lineno,
+        "mode": on_bad,
+        "inode": os.stat(path).st_ino,
+        "filtered": False,
+    })
+    os.replace(final, d["staged"])
     _publish_member_marker(path)
     os.replace(path, d["backup"])
     os.replace(d["staged"], path)
@@ -620,34 +648,100 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
 
     The border was already crossed, so every fault here is a warning
     and nothing is allowed to turn the committed migration into a
-    failure.  Reconciliation already promoted every member's renamed
-    inode; this finishes exactly like an idempotent single-file rerun
-    per member: old per-member checkpoints name the pre-rename inode so
-    they are discarded, the current inode is rescanned (re-encoding a
-    canonical file changes no bytes), any old-format tail a
-    path-reopening appender landed after wrap-up is migrated through a
-    fresh atomic replacement, and racing appenders are converged.
-    Counters count only records *this* invocation newly moves (the
-    post-commit tails); bytes the killed run migrated are not counted.
+    failure.
+
+    A member whose rename left a surviving backup is handled *before*
+    the live path is touched: whole records the killed convergence had
+    not folded off the backup inode are folded into the live migrated
+    file first (deterministic prefix reconstruction), and only then is
+    the backup removed.  A backup whose drain cannot be completed (a
+    record still mid-append, or a missing/stale staging sidecar) is
+    retained with the member work directory and the group marker: the
+    member's live finishing is deferred to the next rerun rather than
+    renaming over a backup that may still hold records.
+
+    After that each member is finished like an idempotent single-file
+    rerun: the current inode is rescanned (re-encoding a canonical file
+    changes no bytes), any old-format tail a path-reopening appender
+    landed after wrap-up is migrated through a fresh atomic
+    replacement, and racing appenders are converged.  Counters count
+    only records *this* invocation newly moves.
     """
     warnings = []
     member_results = []
     salvaged_total = skipped_total = migrated_total = 0
+    retained = set()
 
     for path in paths:
         parent = os.path.dirname(os.path.abspath(path))
         d = _debris(path)
-        # The backup is the pre-rename inode: every record reachable
-        # through a path was drained before staging, so writes still
-        # landing on it after the kill are the same "preempted between
-        # open and write" boundary a single-file rerun documents.
-        try:
-            _remove(d["backup"])
-            _fsync_dir(parent)
-        except OSError as exc:
-            warnings.append(f"{path}: backup removal failed: {exc}")
-
         member_dir = _member_workdir(path)
+
+        if os.path.exists(d["backup"]):
+            # Fold appends stranded on the backup before anything else
+            # may rename the live path over it.
+            sidecar = _read_stage_sidecar(member_dir)
+            keep = True
+            if sidecar is not None:
+                try:
+                    backup_inode = os.stat(d["backup"]).st_ino
+                except OSError as exc:
+                    backup_inode = None
+                    warnings.append(
+                        f"{path}: cannot stat surviving backup: {exc}"
+                    )
+                if backup_inode is not None:
+                    if sidecar["inode"] != backup_inode \
+                            or sidecar["mode"] != on_bad:
+                        warnings.append(
+                            f"{path}: surviving backup does not match the "
+                            "staging record; backup retained, rerun after "
+                            "inspection"
+                        )
+                    else:
+                        appended, bskip, retain, warning = (
+                            _recover_backup_appends(
+                                path, d["backup"], sidecar["offset"],
+                                on_bad, quiesce,
+                                _AuditPrefix(audit_stream, path),
+                                base_size=sidecar["staged_size"],
+                                filtered=False,
+                            )
+                        )
+                        migrated_total += appended
+                        salvaged_total += appended
+                        skipped_total += bskip
+                        if warning:
+                            warnings.append(f"{path}: {warning}")
+                        keep = retain
+            else:
+                warnings.append(
+                    f"{path}: surviving backup without a staging record; "
+                    "backup retained, rerun after inspection"
+                )
+            if keep:
+                # Do not touch this member's live path (a fresh staging
+                # would os.replace over the retained backup); keep the
+                # member work directory and finish it on a later rerun.
+                retained.add(path)
+                member_results.append(MigrationResult(
+                    path=path, records_migrated=0, records_skipped=0,
+                    records_salvaged=0, replaced=False,
+                ))
+                continue
+            try:
+                _remove(d["backup"])
+                _fsync_dir(parent)
+            except OSError as exc:
+                warnings.append(f"{path}: backup removal failed: {exc}")
+                retained.add(path)
+                member_results.append(MigrationResult(
+                    path=path, records_migrated=0, records_skipped=0,
+                    records_salvaged=0, replaced=False,
+                ))
+                continue
+
+        # No surviving backup: normal idempotent live-path finishing.
         shutil.rmtree(member_dir, ignore_errors=True)
         try:
             member = _prepare_member(
@@ -656,7 +750,7 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
             )
             member_replaced = False
             if member.dirty:
-                _stage_member(member)
+                _stage_member(member, on_bad)
                 member_replaced = True
                 salvaged, conv_skipped, lineno, warning = _converge(
                     path, parent, member_dir, member.src, member.offset,
@@ -696,10 +790,18 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
             except OSError:
                 pass
 
-    try:
-        _sweep_dirs(paths, group_dir)
-    except OSError as exc:
-        warnings.append(f"cleanup failed: {exc}")
+    if retained:
+        # Keep the group marker and retained members' work directories
+        # so the next rerun stays in forward-finishing mode.
+        for path in paths:
+            if path in retained:
+                continue
+            shutil.rmtree(_member_workdir(path), ignore_errors=True)
+    else:
+        try:
+            _sweep_dirs(paths, group_dir)
+        except OSError as exc:
+            warnings.append(f"cleanup failed: {exc}")
     replaced = any(m.replaced for m in member_results)
     return migrated_total, skipped_total, salvaged_total, \
         tuple(member_results), warnings, replaced
@@ -876,7 +978,7 @@ def migrate_log_group(paths, *, on_bad="strict",
                     staged = []
                     try:
                         for member in dirty_members:
-                            _stage_member(member)
+                            _stage_member(member, on_bad)
                             staged.append(member)
                             _crash_point("group-stage")
                         _crash_point("group-staged")
