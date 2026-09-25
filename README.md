@@ -222,6 +222,10 @@ Only once all members have completed this sequence is
 deterministically on the rerun from whichever of `staged`/`backup`/the
 live path survive: without the group marker every member is put back
 byte-for-byte as it was; with it the remaining renames are completed.
+When the marker is present, a finishing rerun first **converges any
+append still landing on a retained backup inode and only then deletes
+the backup**, so a writer preempted between opening the old path and
+its single whole-record write loses nothing.
 
 ### Checkpoints and group resume
 
@@ -255,8 +259,134 @@ and each skipped record is written to **stderr** as
 Missing/non-integer/unsupported `v`, wrong field types, and `NaN`,
 `Infinity` or values overflowing to infinity (e.g. `1e999`) are bad
 records; `-0.0` is preserved verbatim.  The summary counters count
-only records the invocation newly migrates; an idempotent finish reports
-`migrated=0`.
+only records the invocation newly rewrites — the group total is exactly
+the sum of the per-member counts (a member left byte-for-byte
+untouched, including an already canonical one, contributes zero on
+both levels); an idempotent finish reports `migrated=0`.
+
+## Linked multi-group migration: `migrate-linked-logs`
+
+`migrate-linked-logs` migrates **several log groups at once**, keeping
+the references *between* them intact.  The caller gives both the groups
+(each an explicit member list; group indices are zero based in list
+order) and a set of reference declarations `SRC:DST`.  Records carry no
+special reference field — for every declared group edge *SRC → DST*,
+**every** record of group SRC points at the first record of group DST
+with the same `order_id` in member-list order and then line order (when
+the two groups are the same, that first match may be the record
+itself):
+
+    python3 -m proto_migrate migrate-linked-logs \
+        --group orders.log --group details.log --ref 1:0
+    python3 -m proto_migrate migrate-linked-logs \
+        --group g1/a.log g1/b.log --group g2/c.log --group g3/d.log \
+        --ref 0:1 --ref 2:1 --ref 2:0 --skip
+
+`--group FILE [FILE ...]` is repeatable (one option per group, its
+members follow it); `--ref SRC:DST` is repeatable and writes one source
+group index, a colon, and one target group index.  When SRC and DST name
+the same group, the first match may be the record itself, i.e. a
+length-one self reference.
+
+Python entry points:
+
+```python
+from proto_migrate import migrate_linked_groups, read_linked_logs
+
+result = migrate_linked_groups(
+    [["orders.log"], ["d1.log", "d2.log"]], [(1, 0)],
+    on_bad="strict")  # or "skip"
+# result.records_migrated / records_skipped / references_bad /
+#        records_salvaged / replaced / members / post_commit_error
+
+records = read_linked_logs([["orders.log"], ["d1.log", "d2.log"]])
+# groups, then members, then lines in order
+```
+
+The whole set is indivisible: either **every** member of every group is
+migrated to the current version together with every reference, or
+**every** member stays exactly as it was — no partially migrated group
+is ever left in durable state after a handled failure or a kill.
+
+### Bad references
+
+There are four kinds, all validated after the members quiesce:
+
+- **missing** — the target group has no record with that order id;
+- **target-skipped** — the earliest matching target line is a bad line
+  the run skips, or a good record itself removed for a bad reference;
+- **illegal-target-version** — the earliest matching target line parses
+  as JSON but carries a missing/non-integer/unsupported `v`;
+- **cycle** — following the declared edges from the source record loops
+  back to that same source line (a self loop included).  The check is
+  per edge: another declaration of the same record may still resolve.
+
+In strict mode the run stops at the **globally first bad line or bad
+reference** (groups in order, members in order, lines in order; edges
+of one line in declaration order), raises `LinkedBadReferenceError` /
+`GroupBadRecordError` (both `ValueError`, CLI exit `3`) and rolls every
+member back before any rename.  In skip mode the offending record (and
+anything that only references removed records, transitively) is
+skipped; one audit entry per removed record is written to **stderr** as
+
+    <filename>:<lineno>:<first 32 raw bytes>
+
+Bad **lines** (`records_skipped`) and bad **references**
+(`references_bad`) are counted separately; like every other counter
+both count only records/references this invocation newly processes, so
+an idempotent rerun reports all zeros.
+
+### Streaming, work files and crash recovery
+
+Every member streams through the same fsynced, size-bounded segments
+and durable local checkpoint as a group run; alongside the segments the
+scan appends a small per-record index row to a spill file in the
+member's `<file>.migrate-linked-tmp/`, checkpointed and rolled back
+together with the output prefix.  After every member quiesces the spill
+files are bulk-loaded into a temporary on-disk SQLite database
+(`.migrate-linked-tmp/refs.sqlite`, rebuilt from scratch every run and
+trivially reconstructable after a crash) where earliest-target
+resolution, target existence, the skip-mode transitive drop closure and
+cycle detection run — no whole group and no reference graph is ever
+held in memory.
+
+Commit is the same recoverable two-phase rename as `migrate-logs`
+(`final → staged`, per-file `.committed` marker, `path → backup`,
+`staged → path`), with linked debris names
+(`.migrate-linked-staged` / `.migrate-linked-backup` /
+`.migrate-linked-tmp`) and a single border marker
+`.migrate-linked-tmp/linked-committed` next to the first member.  A kill
+before the border rolls every rename back and resumes members from
+their checkpoints (prepared members are neither rescanned nor
+rewritten; the finished bytes are byte-for-byte identical to one
+uninterrupted run); a kill after it completes the renames forward, first
+converges appends still landing on the backup inode and deletes the
+backup only once drained, and reduces any later durability/cleanup
+fault to a stderr `warning:` with exit `0`.  Handled pre-border
+failures sweep all work and leave every original byte-for-byte
+untouched.
+
+`read_linked_logs([[...], ...])` returns one flat, version-consistent
+snapshot (groups, members, then lines in order): while the whole set is
+still pre-commit it is served exactly as stored (v1/v2 together are the
+uniform "old" world); once any member crosses its border the whole
+snapshot is normalized to the current version in memory — old/new field
+shapes never mix between or within members, even with a path-reopening
+appender writing old records during wrap-up, and references never
+dangle or point at half a record.
+
+The nested group list and the reference list validate like
+`migrate_log_group`: a non-sequence raises `TypeError` (a flat member
+list and a bare `(src, dst)` pair are non-sequences of the required
+shape and raise `ValueError` instead); an empty/duplicate member list, a
+repeated declaration, or a reference index out of range raises
+`ValueError` (CLI exit `2`); a missing/unreadable member raises
+`FileNotFoundError` at both entry points (CLI exit `1`).  Exit codes
+otherwise match the other subcommands: `0` success (post-border
+warnings included), `1` I/O error, `3` strict-mode bad
+record/reference.  Bad-record rules, the `-0.0` / overflow amount
+semantics, field defaults, and the existing single-file, single-group
+and selftest entry points are unchanged.
 
 ## Tests
 
@@ -276,6 +406,8 @@ recovery, post-commit fault classification, and idempotent reruns.
 - `proto_migrate.read_log(path) -> list[dict]` returns one version-consistent snapshot of a migrating log.
 - `proto_migrate.migrate_log_group(paths, ...) -> GroupMigrationResult` migrates an explicit group of logs as one all-or-nothing unit.
 - `proto_migrate.read_log_group(paths) -> list[dict]` returns one version-consistent snapshot of a whole group.
+- `proto_migrate.migrate_linked_groups(groups, refs, ...) -> LinkedMigrationResult` migrates multiple explicit groups with declared cross-group order references as one all-or-nothing unit.
+- `proto_migrate.read_linked_logs(groups) -> list[dict]` returns one version-consistent snapshot of every linked group.
 - `proto_migrate.VERSIONS -> tuple[int, ...]` supported versions, ascending.
 - `proto_migrate.CURRENT_VERSION -> int` the version `dumps` writes.
 

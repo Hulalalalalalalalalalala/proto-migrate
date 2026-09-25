@@ -374,7 +374,7 @@ class _PreparedMember:
         # state the convergence phase continues from.
         self.offset = offset
         self.lineno = lineno
-        # Records this invocation newly migrates; salvaged is added
+        # Records this invocation newly rewrote; salvaged is added
         # after the border.  Fast-resumed/finishing runs count zero.
         self.run_migrated = run_migrated
         self.run_skipped = run_skipped
@@ -467,14 +467,15 @@ def _prepare_member(path, member_dir, on_bad, segment_size, quiesce,
     cp_fh.close()
 
     if not dirty:
-        # Canonical member (and nothing skipped): it is never renamed.
+        # Canonical member (and nothing skipped): it is never renamed,
+        # so this invocation rewrote none of its records and the member
+        # counts zero (counters only cover records this run rewrote).
         _write_prepared(member_dir, {
             "dirty": False, "offset": offset, "lineno": lineno,
             "migrated": migrated, "skipped": skipped,
         })
         return _PreparedMember(
-            path, member_dir, src, False, offset, lineno,
-            migrated - start_migrated, skipped - start_skipped,
+            path, member_dir, src, False, offset, lineno, 0, 0,
         )
 
     # --- ASSEMBLE + DRAIN: final is the rename source in phase 1.
@@ -584,12 +585,22 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
     The border was already crossed, so every fault here is a warning
     and nothing is allowed to turn the committed migration into a
     failure.  Reconciliation already promoted every member's renamed
-    inode; this finishes exactly like an idempotent single-file rerun
-    per member: old per-member checkpoints name the pre-rename inode so
-    they are discarded, the current inode is rescanned (re-encoding a
-    canonical file changes no bytes), any old-format tail a
-    path-reopening appender landed after wrap-up is migrated through a
-    fresh atomic replacement, and racing appenders are converged.
+    inode.  Each member is then finished in two steps:
+
+      1. The backup (the pre-rename inode) is converged BEFORE it is
+         deleted: records an appender landed on the old inode after the
+         killed run drained it are reachable only through the backup,
+         so they are migrated into the committed file first.  The
+         surviving ``prepared`` marker names the drain offset and line
+         number on that inode.
+      2. The member is finished like an idempotent single-file rerun:
+         old per-member checkpoints name the pre-rename inode so they
+         are discarded, the current inode is rescanned (re-encoding a
+         canonical file changes no bytes), any old-format tail a
+         path-reopening appender landed after wrap-up is migrated
+         through a fresh atomic replacement, and racing appenders are
+         converged.
+
     Counters count only records *this* invocation newly moves (the
     post-commit tails); bytes the killed run migrated are not counted.
     """
@@ -600,38 +611,68 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
     for path in paths:
         parent = os.path.dirname(os.path.abspath(path))
         d = _debris(path)
-        # The backup is the pre-rename inode: every record reachable
-        # through a path was drained before staging, so writes still
-        # landing on it after the kill are the same "preempted between
-        # open and write" boundary a single-file rerun documents.
-        try:
-            _remove(d["backup"])
-            _fsync_dir(parent)
-        except OSError as exc:
-            warnings.append(f"{path}: backup removal failed: {exc}")
-
         member_dir = _member_workdir(path)
+        member_salvaged = 0
+        member_skipped = 0
+        member_replaced = False
+
+        # Step 1: converge the backup's late appends, then remove it.
+        prepared = _read_prepared(member_dir)
+        try:
+            backup = d["backup"]
+            if os.path.exists(backup):
+                src = None
+                try:
+                    if prepared is not None and os.path.getsize(backup) \
+                            > int(prepared["offset"]):
+                        src = open(backup, "rb")
+                        salvaged, conv_skipped, _lineno, warning, \
+                            _rewritten = _converge(
+                                path, parent, member_dir, src,
+                                int(prepared["offset"]),
+                                int(prepared["lineno"]), quiesce,
+                                _AuditPrefix(audit_stream, path), on_bad,
+                            )
+                        member_salvaged += salvaged
+                        member_skipped += conv_skipped
+                        if warning:
+                            warnings.append(f"{path}: {warning}")
+                finally:
+                    if src is not None:
+                        try:
+                            src.close()
+                        except OSError:
+                            pass
+                _remove(backup)
+                _fsync_dir(parent)
+        except (OSError, ValueError) as exc:
+            # Border already crossed: even a bad tail record cannot
+            # un-commit the group; report it as a warning (rerun with
+            # --skip to migrate past it).
+            warnings.append(
+                f"{path}: post-commit finishing incomplete, rerun to "
+                f"finish: {exc}"
+            )
+
+        # Step 2: finish the member like an idempotent single-file rerun.
         shutil.rmtree(member_dir, ignore_errors=True)
         try:
             member = _prepare_member(
                 path, member_dir, on_bad, segment_size, quiesce,
                 _AuditPrefix(audit_stream, path),
             )
-            member_replaced = False
             if member.dirty:
                 _stage_member(member)
                 member_replaced = True
-                salvaged, conv_skipped, lineno, warning = _converge(
-                    path, parent, member_dir, member.src, member.offset,
-                    member.lineno, quiesce,
-                    _AuditPrefix(audit_stream, path), on_bad,
+                salvaged, conv_skipped, lineno, warning, _rewritten = (
+                    _converge(
+                        path, parent, member_dir, member.src,
+                        member.offset, member.lineno, quiesce,
+                        _AuditPrefix(audit_stream, path), on_bad,
+                    )
                 )
-                member.salvaged = salvaged
-                member.run_skipped = conv_skipped
-                member.lineno = lineno
-                salvaged_total += salvaged
-                migrated_total += salvaged
-                skipped_total += conv_skipped
+                member_salvaged += salvaged
+                member_skipped += conv_skipped
                 if warning:
                     warnings.append(f"{path}: {warning}")
                 _remove(path + _BACKUP_SUFFIX)
@@ -641,9 +682,9 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
             except OSError:
                 pass
             member_results.append(MigrationResult(
-                path=path, records_migrated=member.salvaged,
-                records_skipped=member.run_skipped,
-                records_salvaged=member.salvaged,
+                path=path, records_migrated=member_salvaged,
+                records_skipped=member_skipped,
+                records_salvaged=member_salvaged,
                 replaced=member_replaced,
             ))
         except (OSError, ValueError) as exc:
@@ -658,6 +699,9 @@ def _finish_committed_group(paths, group_dir, on_bad, segment_size,
                 shutil.rmtree(member_dir, ignore_errors=True)
             except OSError:
                 pass
+        salvaged_total += member_salvaged
+        skipped_total += member_skipped
+        migrated_total += member_salvaged
 
     try:
         _sweep_dirs(paths, group_dir)
@@ -675,12 +719,14 @@ def _converge_and_finalize(dirty_members, paths, group_dir, on_bad,
     salvaged_total = skipped_total = 0
     for member in dirty_members:
         try:
-            salvaged, conv_skipped, lineno, warning = _converge(
-                member.path,
-                os.path.dirname(os.path.abspath(member.path)),
-                member.member_dir, member.src, member.offset,
-                member.lineno, quiesce,
-                _AuditPrefix(audit_stream, member.path), on_bad,
+            salvaged, conv_skipped, lineno, warning, _rewritten = (
+                _converge(
+                    member.path,
+                    os.path.dirname(os.path.abspath(member.path)),
+                    member.member_dir, member.src, member.offset,
+                    member.lineno, quiesce,
+                    _AuditPrefix(audit_stream, member.path), on_bad,
+                )
             )
         except (OSError, ValueError) as exc:
             # Border already crossed: convergence faults -- even a bad
@@ -730,7 +776,8 @@ def migrate_log_group(paths, *, on_bad="strict",
     checkpoints, and a killed run resumes so prepared members are
     neither rescanned nor rewritten.  Returns
     :class:`GroupMigrationResult` whose counters count only records this
-    invocation newly migrates.
+    invocation newly rewrote (a member left byte-identical -- including
+    an already canonical one -- counts zero).
 
     Raises :class:`TypeError` for a non-sequence member list,
     :class:`ValueError` for an empty or duplicate list (and
@@ -894,9 +941,12 @@ def migrate_log_group(paths, *, on_bad="strict",
                 fcntl.flock(fh, fcntl.LOCK_UN)
                 fh.close()
 
-    totals_migrated = sum(m.run_migrated for m in dirty_members)
-    totals_skipped = sum(m.run_skipped for m in dirty_members)
-    totals_salvaged = sum(m.salvaged for m in dirty_members)
+    # Unified counting: every member (renamed or not) reports only the
+    # records this invocation newly rewrote, so the group totals are
+    # simply the sum over all members.
+    totals_migrated = sum(m.run_migrated for m in members)
+    totals_skipped = sum(m.run_skipped for m in members)
+    totals_salvaged = sum(m.salvaged for m in members)
     member_results = tuple(
         MigrationResult(
             path=m.path,

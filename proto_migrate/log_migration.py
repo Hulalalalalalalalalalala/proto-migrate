@@ -540,10 +540,17 @@ def _available_lines(fd, off):
 
 
 def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
-              audit_stream, on_bad):
+              audit_stream, on_bad, count_rewrites=False, emit_fn=None):
     """Drain appenders across the commit.
 
-    Returns ``(salvaged, skipped, lineno, warning)``.  A repair I/O
+    Returns ``(salvaged, skipped, lineno, warning, rewritten)``.  When
+    *count_rewrites* is true, ``rewritten`` counts only the drained
+    records whose re-encoded bytes actually differ from their raw bytes
+    (an already-canonical tail record is migrated but not "rewritten");
+    callers that only keep the historical salvaged count may ignore it.
+    *emit_fn* overrides the default raw-line conversion (used by
+    migrations whose output shape carries fields the plain codec would
+    drop); it has the same contract as :func:`_emit`.  A repair I/O
     failure after the commit is reported as a warning, never a failure
     of the already-committed migration.
 
@@ -599,18 +606,22 @@ def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
     # straddle bytes live on stale inodes, not in the current file.
     suffix_size = 0
     salvaged_records = 0
+    rewritten_records = 0
     lineno_box = [lineno]
     skipped_box = [0]
+    emit = emit_fn if emit_fn is not None else _emit
 
     def convert_into(buf, raw):
-        nonlocal salvaged_records
-        out, bad = _emit(audit_stream, on_bad, raw, lineno_box[0])
+        nonlocal salvaged_records, rewritten_records
+        out, bad = emit(audit_stream, on_bad, raw, lineno_box[0])
         lineno_box[0] += 1
         if bad:
             skipped_box[0] += 1
             return False
         buf.extend(out)
         salvaged_records += 1
+        if count_rewrites and raw != out:
+            rewritten_records += 1
         return True
 
     def do_rebuild(cur_tail):
@@ -709,7 +720,8 @@ def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
             except OSError:
                 pass
 
-    return salvaged_records, skipped_box[0], lineno_box[0], warning
+    return (salvaged_records, skipped_box[0], lineno_box[0], warning,
+            rewritten_records)
 
 
 def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE,
@@ -877,10 +889,11 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
                     _crash_point("committed")
 
                     # --- CONVERGE with racing appenders ----------------
-                    salvaged, conv_skipped, lineno, warning = _converge(
-                        path, parent, tmp_dir, src, offset, lineno,
-                        quiesce, audit_stream, on_bad,
-                    )
+                    salvaged, conv_skipped, lineno, warning, \
+                        _rewritten = _converge(
+                            path, parent, tmp_dir, src, offset, lineno,
+                            quiesce, audit_stream, on_bad,
+                        )
                     skipped += conv_skipped
                     if warning and post_commit_error is None:
                         post_commit_error = warning
