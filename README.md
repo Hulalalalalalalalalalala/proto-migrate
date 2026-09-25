@@ -351,10 +351,14 @@ disjoint group sets.  Every member is held under a non-blocking
 **lease** — an exclusive `flock` on its `<path>.migrate.lock` file, the
 same lock the single-file and single-group migrators wait on — so
 overlapping members are mutually exclusive while disjoint group sets
-advance in parallel (each group set owns a distinct
-`.migrate-linked-tmp-<hash>` work directory next to its first member;
-the hash covers the member lists, the policy and link set stay in the
-manifest).  A lease held by a live instance raises
+advance in parallel.  **The group work directory layout is**
+`.migrate-linked-tmp-<hash>/` next to the first group's first member,
+where `<hash>` is a 16-hex-character SHA-1 of the absolute member
+lists (this hashed layout is the declared contract: a distinct group
+set anchored in the same directory owns a distinct directory, and the
+manifest inside names the member lists, the bad-record policy and the
+link set).  Each member owns its own ` <path>.migrate-linked-tmp/`
+directory.  A lease held by a live instance raises
 `MigrationLockedError` (CLI exit `1`) instead of waiting; a holder that
 finishes or disappears — however abruptly — releases its leases via the
 OS, and the next instance reclaims them and takes over from the durable
@@ -362,6 +366,141 @@ checkpoints without rescanning prepared members.  Takeover and resume
 leave no partial migration shape: the outcome is byte-for-byte
 identical to running the same instances serially.  Lease and index
 state lives only in local files and can always be rebuilt.
+
+#### Linked work files
+
+Inside the group work directory `.migrate-linked-tmp-<hash>/`:
+
+- `manifest.json` — the absolute member lists, the bad-record policy
+  and the link declarations;
+- `linked-committed` — the group commit marker (the single
+  success/failure border);
+- `refs.sqlite3` — the streaming reference-resolution spill database,
+  rebuilt on every uncommitted run;
+- `linked-resolved` — the durable reference-resolution outcome written
+  by online compaction (see below); absent on an uncompacted run.
+
+Inside each member's `<path>.migrate-linked-tmp/`:
+
+- `seg-NNNNNN` — fsynced output segments, the local `checkpoint` log,
+  the assembled `final`, and the `prepared` / `linked-prepared`
+  markers (same semantics as a single-group run);
+- `lines` — the durable per-line index classifying every consumed
+  source line (removed once compaction has published `linked-resolved`
+  and the member's `compacted` receipt);
+- `compacted` — present when the member's durable state is in the
+  compact form (one merged segment, one checkpoint record, no line
+  index);
+- `linked-final` — output filtered of bad-reference records, used by
+  the member's rename.
+
+## Read-only rehearsal: `rehearse-linked-logs`
+
+`rehearse-linked-logs` is the read-only dry run of a linked migration:
+it takes the **same group sets and `--link` declarations** as
+`migrate-linked-logs` and reports exactly what that migration would do,
+without changing a single file.
+
+    python3 -m proto_migrate rehearse-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id                # strict (default)
+    python3 -m proto_migrate rehearse-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id --skip
+
+Python entry point:
+
+```python
+from proto_migrate import rehearse_linked_logs
+
+report = rehearse_linked_logs(
+    [["orders.log"], ["details.log"]],
+    links=[(1, 0, "order_id", "order_id")],
+    on_bad="strict",            # or "skip"
+)
+# report.members[i]: per-member records_migrated / records_skipped /
+#   records_dropped / would_replace / predicted_bytes, with every bad
+#   record and dropped record located (group, member, 1-based line)
+# report.bad_records / report.bad_references: located in global
+#   group/member/line order
+# report.discarded: the exact skip-mode discard list (with the exact
+#   audit bytes the real migration writes to stderr)
+# report.references_bad: the bad-reference edge count
+# report.first_error / report.first_error_kind: the strict-mode global
+#   first-error attribution (GroupBadRecordError or
+#   LinkedBadReferenceError with the identical path/line/message)
+```
+
+Guarantees:
+
+- **Strictly read-only.** It takes no member lease, creates no lock or
+  work file, writes nothing next to any member (its spill database
+  lives in a private temporary directory it removes on exit), and never
+  blocks an appender or another instance.  A rehearsal while an active
+  instance holds the leases and is migrating the same members proceeds
+  normally; it never raises `MigrationLockedError`.
+- **Pinned, non-drifting locations.** Each member is pinned at open
+  time (one inode, one frozen length) like the streaming snapshot; only
+  complete lines in that pinned prefix are considered, so the reported
+  group/member/line locations never drift while appenders keep writing.
+- **Record-for-record agreement with the real run.** Every verdict
+  (kept / skipped bad record / dropped bad-reference record) for a line
+  in the pinned prefix matches the real migration's verdict for that
+  same line, including the global first-error attribution and the exact
+  skip-mode audit bytes.  With the files quiet between the rehearsal
+  and the migration, aggregate counters and the per-member rewrite
+  counts match the real `LinkedMigrationResult` exactly; the report's
+  `predicted_bytes` equal the migrated member bytes.
+- Bad-record and bad-reference rules, exception types, audit format
+  and validation/exit-code taxonomy are exactly the migration's; the
+  rehearsal CLI itself always exits `0` on a successful read-only pass
+  (it *reports* the strict first error instead of raising it).
+
+## Online compaction: `compact-linked-logs`
+
+Repeatedly killed/resumed linked migrations accumulate durable state:
+one checkpoint record per output segment in every member's `checkpoint`
+log and one record per consumed source line in every member's `lines`
+index.  `compact-linked-logs` folds that state into a deterministic
+compact form whose size grows with the **member count, not the total
+line count**:
+
+    python3 -m proto_migrate compact-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id [--strict|--skip]
+
+Python entry point:
+
+```python
+from proto_migrate import compact_linked_logs
+
+result = compact_linked_logs(
+    [["orders.log"], ["details.log"]],
+    links=[(1, 0, "order_id", "order_id")], on_bad="skip",
+)
+# result.members_prepared / members_compacted / references_bad;
+# result.first_error carries the pending strict-mode first problem.
+```
+
+Compaction prepares any not-yet-prepared member (never rescanning a
+prepared one), resolves references once into the durable
+`linked-resolved` record, then per member concatenates the retained
+segments into one, collapses the checkpoint log to header + one record,
+publishes the `compacted` receipt and removes the per-line `lines`
+index.  The original log files are never modified and no commit marker
+is published; a later `migrate-linked-logs` resumes every member from
+its receipt **without rescanning it** and finishes byte-for-byte
+identically to a run that was never compacted — the migrated output is
+byte-identical, resume semantics and the fresh-only summary counters
+are unchanged (a run that only finishes compacted state reports zero).
+Compaction takes the same non-blocking member leases as the migration
+(`MigrationLockedError` while one is held).  It is itself
+crash-recoverable: killed at any point, a rerun reuses `compacted`
+receipts and the `linked-resolved` record, never rescans a completed
+member, and reaches the same compact state.  A strict-mode problem is
+not raised by compaction — the files stay untouched — but its
+attribution is reported (`result.first_error`) and the subsequent
+migration raises the identical error.
 
 ### Durability, resume and snapshots
 
@@ -421,7 +560,13 @@ linked-migration tests additionally cover the streaming snapshot cursor
 TypeError/ValueError/FileNotFoundError taxonomy), multi-instance leases
 (mutual exclusion on overlapping members, parallel disjoint instances,
 crash takeover), the strict-mode global first-error ordering, and
-post-commit-crash backup convergence.
+post-commit-crash backup convergence.  The rehearsal and compaction
+tests cover report/real-run agreement (counts, located verdicts, exact
+audit bytes, predicted bytes), read-only behaviour under live leases
+and appenders, the deterministic compact form, compaction crash
+recovery at every crash point, zero-rescan resume from compacted
+state, byte-identical finishing migrations, and descriptor reclaim for
+abandoned stream cursors.
 
 ## Public interface
 
@@ -433,8 +578,11 @@ post-commit-crash backup convergence.
 - `proto_migrate.migrate_log_group(paths, ...) -> GroupMigrationResult` migrates an explicit group of logs as one all-or-nothing unit.
 - `proto_migrate.read_log_group(paths) -> list[dict]` returns one version-consistent snapshot of a whole group.
 - `proto_migrate.migrate_linked_logs(groups, links=..., ...) -> LinkedMigrationResult` migrates several groups with cross-group reference integrity as one all-or-nothing unit; raises `MigrationLockedError` while a needed member lease is held by a live instance.
+- `proto_migrate.rehearse_linked_logs(groups, links=..., ...) -> RehearsalReport` performs the read-only rehearsal of a linked migration: per-member rewrite counts, globally ordered bad-record/bad-reference locations, strict-mode first-error attribution and the skip-mode discard list, without writing anything or taking a lease.
+- `proto_migrate.compact_linked_logs(groups, links=..., ...) -> CompactionResult` compacts the durable checkpoint/line-index state of an uncommitted linked migration into deterministic, member-count-sized, crash-recoverable form without rescanning completed members.
 - `proto_migrate.read_linked_logs(groups) -> list[list[dict]]` returns one version-consistent snapshot across all linked groups.
 - `proto_migrate.read_linked_logs_stream(groups, cursor=None, batch_records=...) -> (list[dict], str | None)` returns the same snapshot in cursor-resumable, member-aligned batches.
+- `proto_migrate.close_linked_logs_stream(cursor)` releases the descriptors a still-open stream pinned (the cursor stays resumable); idle sessions are also reaped automatically.
 - `proto_migrate.VERSIONS -> tuple[int, ...]` supported versions, ascending.
 - `proto_migrate.CURRENT_VERSION -> int` the version `dumps` writes.
 

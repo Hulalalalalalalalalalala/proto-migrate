@@ -152,6 +152,7 @@ __all__ = [
     "migrate_linked_logs",
     "read_linked_logs",
     "read_linked_logs_stream",
+    "close_linked_logs_stream",
     "run_linked_cli",
 ]
 
@@ -164,6 +165,12 @@ _LINKED_FINAL = "linked-final"
 _LINES_NAME = "lines"
 _REFS_DB = "refs.sqlite3"
 _FINAL = "final"
+# Online compaction state: the durable reference-resolution record in
+# the group work directory, and the per-member compact receipt in each
+# member work directory.  Both are declared in README.md ("Linked work
+# files"); they live only in local files and can always be rebuilt.
+_LINKED_RESOLVED = "linked-resolved"
+_COMPACTED = "compacted"
 
 _MEMBER_TMP_SUFFIX = ".migrate-linked-tmp"
 _BACKUP_SUFFIX = ".migrate-linked-backup"
@@ -449,6 +456,218 @@ def _read_linked_prepared(member_dir):
 
 
 # ---------------------------------------------------------------------------
+# Durable reference-resolution record and per-member compaction
+# ---------------------------------------------------------------------------
+#
+# Online compaction (compact_linked_logs) shrinks the durable work state
+# of an uncommitted run to a deterministic compact form whose
+# bookkeeping grows with the member count, not with the total line
+# count:
+#
+#   * the group work directory gains ``linked-resolved`` -- the full
+#     resolution outcome (per-member bad lines and dropped records with
+#     their source offsets, the globally first bad reference, the bad
+#     reference count), written before any member is compacted;
+#   * each member's checkpoint log is collapsed to its header plus one
+#     record over a single merged segment, and the per-line index
+#     (``lines``) is removed -- the resolution record replaces it.
+#
+# A member carrying a valid ``compacted`` receipt is never rescanned:
+# the migration resume path and compaction reruns both take the member
+# straight from its receipt plus the collapsed checkpoint.  Everything
+# is rebuildable local state: losing the resolution record simply
+# forces a fresh prepare.
+
+
+def _resolution_key(groups, links, on_bad):
+    """Identity of the configuration a resolution record belongs to."""
+    key = json.dumps({
+        "groups": [[os.path.abspath(p) for p in g] for g in groups],
+        "links": [list(link) for link in links],
+        "on_bad": on_bad,
+    }, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def _write_resolution(group_dir, record):
+    path = os.path.join(group_dir, _LINKED_RESOLVED)
+    with open(path + ".tmp", "wb") as f:
+        f.write(json.dumps(record).encode("ascii"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+    _fsync_dir(group_dir)
+
+
+def _read_resolution(group_dir):
+    try:
+        with open(os.path.join(group_dir, _LINKED_RESOLVED), "rb") as f:
+            data = json.loads(f.read())
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return None
+        if not isinstance(data.get("members"), list):
+            return None
+        return data
+    except (OSError, ValueError):
+        return None
+
+
+def _write_compacted(member_dir, info):
+    path = os.path.join(member_dir, _COMPACTED)
+    with open(path + ".tmp", "wb") as f:
+        f.write(json.dumps(info).encode("ascii"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+    _fsync_dir(member_dir)
+
+
+def _read_compacted(member_dir):
+    try:
+        with open(os.path.join(member_dir, _COMPACTED), "rb") as f:
+            data = json.loads(f.read())
+        for key in ("offset", "lineno", "dirty", "seg_size"):
+            if key not in data:
+                return None
+        return data
+    except (OSError, ValueError):
+        return None
+
+
+def _compact_member_state(member_dir):
+    """Compact one prepared member's durable work state, idempotently.
+
+    Collapses the checkpoint log to its header plus a single record
+    over one merged segment, writes the ``compacted`` receipt, then
+    removes the per-line index (the group-level resolution record,
+    already durable, replaces it).  Returns True when this call did
+    compacting work, False when the member was already compact.
+
+    Every step is ordered so a kill leaves a state the rerun either
+    resumes directly or redoes without rescanning the member:
+
+      1. retained segments are truncated to their recorded sizes and
+         concatenated (record order) into ``compact.tmp``;
+      2. ``compact.tmp`` is atomically renamed over the first retained
+         segment (the checkpoint's existing first record stays valid
+         throughout: the merged file is never shorter than recorded);
+      3. the checkpoint log is atomically replaced by header + one
+         record naming the merged segment;
+      4. the other segments are deleted;
+      5. the ``compacted`` receipt is published;
+      6. the line index is deleted (last, so a kill before the receipt
+         keeps the index and the member stays resumable the old way).
+    """
+    receipt = _read_compacted(member_dir)
+    if receipt is not None:
+        # Already compact: only the index-deletion mop-up may remain.
+        try:
+            os.remove(os.path.join(member_dir, _LINES_NAME))
+            _fsync_dir(member_dir)
+        except FileNotFoundError:
+            pass
+        return False
+    prepared = _read_linked_prepared(member_dir)
+    if prepared is None:
+        return False
+    inode, mode, records, _good = _read_checkpoint_log(member_dir)
+    offset = int(prepared["offset"])
+    lineno = int(prepared["lineno"])
+    dirty = bool(prepared["dirty"])
+    if records:
+        # One merged segment named after the first retained segment.
+        merged_name = records[0][4]
+        tmp = os.path.join(member_dir, "compact.tmp")
+        total = 0
+        with open(tmp, "wb") as out:
+            for _off, _count, _skipped, _d, name, size in records:
+                seg = os.path.join(member_dir, name)
+                if os.path.getsize(seg) != size:
+                    with open(seg, "r+b") as f:
+                        f.truncate(size)
+                with open(seg, "rb") as part:
+                    remaining = size
+                    while remaining:
+                        chunk = part.read(min(1 << 20, remaining))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        remaining -= len(chunk)
+                        total += len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, os.path.join(member_dir, merged_name))
+        last = records[-1]
+        cp_tmp = os.path.join(member_dir, "checkpoint.tmp")
+        with open(cp_tmp, "wb") as f:
+            f.write(f"src {inode} {mode}\n".encode("ascii"))
+            f.write(
+                f"{last[0]} {last[1]} {last[2]} {last[3]} "
+                f"{merged_name} {total}\n".encode("ascii")
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(cp_tmp, os.path.join(member_dir, "checkpoint"))
+        _fsync_dir(member_dir)
+        for name in os.listdir(member_dir):
+            if name.startswith("seg-") and name != merged_name:
+                os.remove(os.path.join(member_dir, name))
+        _fsync_dir(member_dir)
+        seg_size = total
+    else:
+        # An empty member has no segments and no checkpoint records.
+        seg_size = 0
+    _write_compacted(member_dir, {
+        "version": 1,
+        "offset": offset,
+        "lineno": lineno,
+        "dirty": dirty,
+        "seg_size": seg_size,
+    })
+    try:
+        os.remove(os.path.join(member_dir, _LINES_NAME))
+        _fsync_dir(member_dir)
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _resume_compacted_member(index, group_index, path, member_dir, on_bad):
+    """Resume a compacted member from its receipt; never rescans."""
+    receipt = _read_compacted(member_dir)
+    if receipt is None:
+        return None
+    inode, mode, records, _good = _read_checkpoint_log(member_dir)
+    try:
+        current_inode = os.stat(path).st_ino
+    except OSError:
+        return None
+    if inode != current_inode or mode != on_bad:
+        return None
+    offset = int(receipt["offset"])
+    lineno = int(receipt["lineno"])
+    dirty = bool(receipt["dirty"])
+    if records:
+        off, count, skipped, dirty_flag, _name, size = records[-1]
+        if len(records) != 1 or off != offset \
+                or count + skipped != lineno or bool(dirty_flag) != dirty \
+                or size != int(receipt["seg_size"]):
+            return None
+    elif offset != 0 or lineno != 0:
+        return None
+    if dirty and not os.path.isfile(os.path.join(member_dir, _FINAL)):
+        return None
+    try:
+        src = open(path, "rb")
+    except OSError:
+        return None
+    return _LinkedMember(
+        index, group_index, path, member_dir, src, dirty, offset,
+        lineno, 0, 0, lineno,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Rename debris reconciliation (crash recovery)
 # ---------------------------------------------------------------------------
 
@@ -496,6 +715,33 @@ def _reconcile_linked_member(path, committed):
 # ---------------------------------------------------------------------------
 # Per-member durable line index
 # ---------------------------------------------------------------------------
+
+
+def _project_payload(kind, payload):
+    """Project one consumed line to its string fields for the index.
+
+    *kind* is a ``LINE_*`` class; *payload* is the migrated output bytes
+    for a good line, the raw source bytes otherwise.  Only string fields
+    survive -- the projection exists to resolve references, and a
+    non-string field value is never a reference.
+    """
+    try:
+        if kind == LINE_GOOD:
+            # The migrated, canonical output bytes.
+            obj = json.loads(payload)
+        else:
+            # A skipped bad line: parse leniently (NaN/Infinity
+            # tolerated) so its key fields still identify it as a
+            # reference target.
+            obj = json.loads(
+                payload.decode("utf-8"),
+                parse_constant=lambda _c: None,
+            )
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    return {k: v for k, v in obj.items() if isinstance(v, str)}
 
 
 class _LineIndex:
@@ -550,31 +796,12 @@ class _LineIndex:
         return pos
 
     def record(self, offset, kind, payload):
-        proj = self._project(kind, payload)
+        proj = _project_payload(kind, payload)
         blob = json.dumps(
             proj, ensure_ascii=True, separators=(",", ":"), sort_keys=True
         ).encode("ascii")
         self._fh.write(_LINE_HEADER.pack(offset, kind, 0, len(blob)))
         self._fh.write(blob)
-
-    def _project(self, kind, payload):
-        try:
-            if kind == LINE_GOOD:
-                # The migrated, canonical output bytes.
-                obj = json.loads(payload)
-            else:
-                # A skipped bad line: parse leniently (NaN/Infinity
-                # tolerated) so its key fields still identify it as a
-                # reference target.
-                obj = json.loads(
-                    payload.decode("utf-8"),
-                    parse_constant=lambda _c: None,
-                )
-        except (ValueError, UnicodeDecodeError):
-            return {}
-        if not isinstance(obj, dict):
-            return {}
-        return {k: v for k, v in obj.items() if isinstance(v, str)}
 
     def sync(self):
         self._fh.flush()
@@ -637,6 +864,14 @@ class _LinkedMember:
         self.fresh_from = fresh_from
         self.salvaged = 0
         self.dropped = set()
+        # Post-resolution per-line decisions, held in memory so the
+        # filtering/audit/error paths never need the durable line index
+        # (which online compaction removes).  Populated either from the
+        # freshly built reference index or from the durable resolution
+        # record a compaction left behind.
+        self.bad_lines = []          # sorted lineno0 of non-good lines
+        self.bad_line_offsets = {}   # lineno0 -> source offset
+        self.dropped_offsets = {}    # lineno0 -> source offset
 
 
 def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
@@ -716,19 +951,40 @@ def _resume_linked_prepared(index, group_index, path, member_dir, on_bad):
     )
 
 
-def _first_indexed_bad_line(member):
-    """``(lineno0, offset)`` of the member's first bad source line, if any.
+def _collect_member_decisions(member, dropped):
+    """Populate a member's in-memory decisions from its line index.
 
-    Strict mode defers bad lines during prepare instead of raising, so
-    the durable line index is the record of them -- for freshly scanned
-    and checkpoint-resumed members alike.
+    Used on the freshly resolved path: the durable line index is
+    streamed once and the offsets of exactly the lines the later
+    filtering/audit/error paths need (bad lines, dropped records) are
+    kept; nothing per-line is retained for good, kept lines.
     """
+    wanted = dropped.get(member.index, set())
     for lineno0, offset, kind, _proj in _stream_line_entries(
         member.member_dir
     ):
         if kind != LINE_GOOD:
-            return lineno0, offset
-    return None
+            member.bad_lines.append(lineno0)
+            member.bad_line_offsets[lineno0] = offset
+        elif lineno0 in wanted:
+            member.dropped_offsets[lineno0] = offset
+
+
+def _apply_resolution_record(members, resolution):
+    """Populate in-memory decisions from a durable resolution record."""
+    for member in members:
+        entry = resolution["members"][member.index]
+        member.bad_lines = sorted(
+            int(lineno0) for lineno0, _offset in entry["bad_lines"]
+        )
+        member.bad_line_offsets = {
+            int(lineno0): int(offset)
+            for lineno0, offset in entry["bad_lines"]
+        }
+        member.dropped_offsets = {
+            int(lineno0): int(offset)
+            for lineno0, offset in entry["dropped"]
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +1032,27 @@ class _RefsDb:
 
     def build_member(self, member, dst_links, src_links):
         """Index one member from its durable line index (streaming)."""
+        entries = (
+            (lineno0, kind, proj)
+            for lineno0, _offset, kind, proj
+            in _stream_line_entries(member.member_dir)
+        )
+        self._build_entries(member.index, entries, dst_links, src_links,
+                            member.fresh_from, projected=True)
+
+    def build_scanned_member(self, index, entries, dst_links, src_links,
+                             fresh_from=0):
+        """Index one member from in-memory ``(lineno0, kind, payload)``.
+
+        Used by the read-only rehearsal: *payload* is the migrated
+        output bytes for a good line, the raw source bytes otherwise --
+        exactly the payloads the durable line index records.
+        """
+        self._build_entries(index, entries, dst_links, src_links,
+                            fresh_from, projected=False)
+
+    def _build_entries(self, member_index, entries, dst_links, src_links,
+                       fresh_from, projected):
         db = self._db
         cur = db.cursor()
         keys, skips, badvs, edge_rows = [], [], [], []
@@ -802,13 +1079,12 @@ class _RefsDb:
                     "VALUES (?,?,?,?)", edge_rows)
                 edge_rows.clear()
 
-        for lineno0, _offset, kind, proj in _stream_line_entries(
-            member.member_dir
-        ):
+        for lineno0, kind, payload in entries:
+            proj = payload if projected else _project_payload(kind, payload)
             if kind == LINE_GOOD:
                 cur.execute(
                     "INSERT INTO nodes(mi, lineno) VALUES (?,?)",
-                    (member.index, lineno0),
+                    (member_index, lineno0),
                 )
                 node_id = cur.lastrowid
                 for link_id, field in dst_links:
@@ -820,7 +1096,7 @@ class _RefsDb:
                     if value is not None:
                         edge_rows.append((
                             node_id, link_id, value,
-                            1 if lineno0 >= member.fresh_from else 0,
+                            1 if lineno0 >= fresh_from else 0,
                         ))
             else:
                 rows = badvs if kind == LINE_BAD_VERSION else skips
@@ -981,34 +1257,42 @@ class _RefsDb:
 def _write_linked_final(member):
     """Write the member's output minus its bad-reference records.
 
-    Dirty members are filtered from their assembled ``final``; clean
-    members (canonical bytes, never re-encoded) are filtered straight
-    from the source byte ranges the line index recorded.  Both are
-    byte-level operations -- nothing is rescanned or re-decoded.
+    Dirty members are filtered from their assembled ``final`` (which
+    holds exactly the good lines, in source order); clean members
+    (canonical bytes, never re-encoded, hence no bad lines) are
+    filtered straight from the prepared source prefix.  Both are
+    byte-level operations driven by the in-memory per-line decisions --
+    nothing is rescanned or re-decoded, and the durable line index is
+    not needed (online compaction removes it).
     """
     out_path = os.path.join(member.member_dir, _LINKED_FINAL)
     if member.dirty:
         final = os.path.join(member.member_dir, _FINAL)
-        entries = (
-            entry for entry in _stream_line_entries(member.member_dir)
-            if entry[2] == LINE_GOOD
-        )
+        # The final's nth line is the nth *good* source line; bad
+        # source lines never reached it, so its source line number is
+        # advanced past the member's bad lines before each mapping.
+        bad = sorted(member.bad_lines)
+        bad_count = len(bad)
         with open(final, "rb") as fin, open(out_path, "wb") as out:
-            for lineno0, _offset, _kind, _proj in entries:
-                line = fin.readline()
-                if lineno0 not in member.dropped:
+            src_no = 0
+            bad_i = 0
+            for line in fin:
+                while bad_i < bad_count and bad[bad_i] == src_no:
+                    src_no += 1
+                    bad_i += 1
+                if src_no not in member.dropped:
                     out.write(line)
+                src_no += 1
             out.flush()
             os.fsync(out.fileno())
     else:
         with open(member.path, "rb") as src, open(out_path, "wb") as out:
-            for lineno0, offset, kind, _proj in _stream_line_entries(
-                member.member_dir
-            ):
-                if kind != LINE_GOOD or lineno0 in member.dropped:
-                    continue
-                src.seek(offset)
-                out.write(src.readline())
+            for lineno0 in range(member.lineno):
+                line = src.readline()
+                if not line:
+                    break
+                if lineno0 not in member.dropped:
+                    out.write(line)
             out.flush()
             os.fsync(out.fileno())
     _fsync_dir(member.member_dir)
@@ -1018,12 +1302,8 @@ def _audit_dropped(member, audit_stream):
     """One ``<file>:<lineno>:<first 32 bytes>`` entry per dropped record."""
     prefix = _AuditPrefix(audit_stream, member.path)
     with open(member.path, "rb") as src:
-        for lineno0, offset, kind, _proj in _stream_line_entries(
-            member.member_dir
-        ):
-            if kind != LINE_GOOD or lineno0 not in member.dropped:
-                continue
-            src.seek(offset)
+        for lineno0 in sorted(member.dropped):
+            src.seek(member.dropped_offsets[lineno0])
             prefix.write(_audit_line(lineno0 + 1, src.readline()))
     audit_stream.flush()
 
@@ -1419,6 +1699,54 @@ def _finish_committed_linked(paths, group_dir, on_bad,
 # ---------------------------------------------------------------------------
 
 
+def _linked_group_state(groups, links, on_bad, paths, group_dir):
+    """Validate/refresh the manifest and reconcile interrupted renames.
+
+    Shared by the migration and the online compaction.  Returns whether
+    the group commit marker exists.  Raises ValueError when the durable
+    commit marker belongs to a different configuration.
+    """
+    manifest = _read_linked_manifest(group_dir)
+    committed = os.path.exists(os.path.join(group_dir, _LINKED_COMMITTED))
+    abs_groups = [[os.path.abspath(p) for p in g] for g in groups]
+    if manifest is not None:
+        same_group = (
+            manifest.get("groups") == abs_groups
+            and manifest.get("links") == [list(l) for l in links]
+            and manifest.get("on_bad") == on_bad
+        )
+        if not same_group:
+            if committed:
+                raise ValueError(
+                    "linked commit marker exists for a different "
+                    "group list, link set or policy; refusing to "
+                    "mix runs"
+                )
+            # An earlier uncommitted attempt for a different
+            # configuration used the same anchor directory:
+            # reverse its renames, then sweep its work state.
+            old_paths = [
+                p for p in (p for g in manifest.get("groups", [])
+                            for p in g)
+                if os.path.exists(p)
+                or os.path.exists(p + _BACKUP_SUFFIX)
+                or os.path.exists(p + _STAGED_SUFFIX)
+            ]
+            for old_path in old_paths:
+                _reconcile_linked_member(old_path, committed=False)
+            _sweep_linked(old_paths, group_dir)
+            manifest = None
+    os.makedirs(group_dir, exist_ok=True)
+    if manifest is None:
+        _write_linked_manifest(group_dir, groups, links, on_bad)
+    _remove(os.path.join(group_dir, _LINKED_COMMITTED_TMP))
+
+    # Resolve interrupted renames before touching content.
+    for path in paths:
+        _reconcile_linked_member(path, committed)
+    return committed
+
+
 def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                         segment_size=DEFAULT_SEGMENT_SIZE,
                         quiesce=DEFAULT_QUIESCE, audit=None):
@@ -1486,46 +1814,9 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
         try:
             _crash_point("linked-lock")
 
-            manifest = _read_linked_manifest(group_dir)
-            committed = os.path.exists(
-                os.path.join(group_dir, _LINKED_COMMITTED)
+            committed = _linked_group_state(
+                groups, links, on_bad, paths, group_dir
             )
-            abs_groups = [[os.path.abspath(p) for p in g] for g in groups]
-            if manifest is not None:
-                same_group = (
-                    manifest.get("groups") == abs_groups
-                    and manifest.get("links") == [list(l) for l in links]
-                    and manifest.get("on_bad") == on_bad
-                )
-                if not same_group:
-                    if committed:
-                        raise ValueError(
-                            "linked commit marker exists for a different "
-                            "group list, link set or policy; refusing to "
-                            "mix runs"
-                        )
-                    # An earlier uncommitted attempt for a different
-                    # configuration used the same anchor directory:
-                    # reverse its renames, then sweep its work state.
-                    old_paths = [
-                        p for p in (p for g in manifest.get("groups", [])
-                                    for p in g)
-                        if os.path.exists(p)
-                        or os.path.exists(p + _BACKUP_SUFFIX)
-                        or os.path.exists(p + _STAGED_SUFFIX)
-                    ]
-                    for old_path in old_paths:
-                        _reconcile_linked_member(old_path, committed=False)
-                    _sweep_linked(old_paths, group_dir)
-                    manifest = None
-            os.makedirs(group_dir, exist_ok=True)
-            if manifest is None:
-                _write_linked_manifest(group_dir, groups, links, on_bad)
-            _remove(os.path.join(group_dir, _LINKED_COMMITTED_TMP))
-
-            # Resolve interrupted renames before touching content.
-            for path in paths:
-                _reconcile_linked_member(path, committed)
 
             if committed:
                 mig, conv_skipped, salvaged, member_res, warnings = (
@@ -1547,13 +1838,36 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
 
             # --- PREPARE every member (resumed via local checkpoints).
             try:
+                resolution = _read_resolution(group_dir)
+                if resolution is not None and (
+                    resolution.get("key")
+                    != _resolution_key(groups, links, on_bad)
+                    or len(resolution["members"]) != len(paths)
+                ):
+                    resolution = None
                 index = 0
                 for group_index, group in enumerate(groups):
                     for path in group:
                         member_dir = _linked_member_dir(path)
-                        member = _resume_linked_prepared(
-                            index, group_index, path, member_dir, on_bad
-                        )
+                        member = None
+                        if resolution is not None:
+                            # Online compaction left a durable
+                            # resolution: compacted members resume from
+                            # their receipt without any line index.
+                            member = _resume_compacted_member(
+                                index, group_index, path, member_dir,
+                                on_bad,
+                            )
+                        elif _read_compacted(member_dir) is not None:
+                            # Compacted but the resolution record is
+                            # gone: the line index is unrecoverable, so
+                            # the member is prepared from scratch.
+                            shutil.rmtree(member_dir, ignore_errors=True)
+                        if member is None:
+                            member = _resume_linked_prepared(
+                                index, group_index, path, member_dir,
+                                on_bad,
+                            )
                         if member is None:
                             member = _prepare_linked_member(
                                 index, group_index, path, member_dir,
@@ -1564,27 +1878,48 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                         index += 1
                 _crash_point("linked-prepare")
 
-                # --- RESOLVE references from the durable line indexes.
-                # The spill database is rebuilt on every uncommitted
-                # run; building it reads only the per-member line
-                # indexes, never the sources.
-                refs_path = os.path.join(group_dir, _REFS_DB)
-                _remove(refs_path)
-                refs = _RefsDb(refs_path)
-                try:
+                if resolution is not None:
+                    # The resolution outcome is durable; nothing is
+                    # resolved anew, so this run reports zero fresh bad
+                    # references (exactly like a checkpoint resume).
+                    references_bad = 0
+                    dropped = {
+                        mi: {
+                            int(lineno0)
+                            for lineno0, _offset
+                            in resolution["members"][mi]["dropped"]
+                        }
+                        for mi in range(len(resolution["members"]))
+                        if resolution["members"][mi]["dropped"]
+                    }
+                    first = resolution["first_bad_ref"]
+                    if first is not None:
+                        first = tuple(first)
+                    _apply_resolution_record(members, resolution)
+                else:
+                    # --- RESOLVE references from the durable line
+                    # indexes.  The spill database is rebuilt on every
+                    # uncommitted run; building it reads only the
+                    # per-member line indexes, never the sources.
+                    refs_path = os.path.join(group_dir, _REFS_DB)
+                    _remove(refs_path)
+                    refs = _RefsDb(refs_path)
+                    try:
+                        for member in members:
+                            refs.build_member(
+                                member,
+                                dst_links.get(member.group_index, []),
+                                src_links.get(member.group_index, []),
+                            )
+                        refs.validate()
+                        _crash_point("linked-refs")
+                        references_bad = refs.fresh_bad_edges()
+                        dropped = refs.dropped_lines()
+                        first = refs.first_bad()
+                    finally:
+                        refs.close()
                     for member in members:
-                        refs.build_member(
-                            member,
-                            dst_links.get(member.group_index, []),
-                            src_links.get(member.group_index, []),
-                        )
-                    refs.validate()
-                    _crash_point("linked-refs")
-                    references_bad = refs.fresh_bad_edges()
-                    dropped = refs.dropped_lines()
-                    first = refs.first_bad()
-                finally:
-                    refs.close()
+                        _collect_member_decisions(member, dropped)
 
                 if on_bad == "strict":
                     # The globally first problem -- bad line or bad
@@ -1596,18 +1931,17 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
                     # first.
                     bad_line = None
                     for member in members:
-                        hit = _first_indexed_bad_line(member)
-                        if hit is not None:
-                            bad_line = (member, hit[0], hit[1])
+                        if member.bad_lines:
+                            bad_line = (member, member.bad_lines[0])
                             break
                     if bad_line is not None and (
                         first is None
                         or (bad_line[0].index, bad_line[1])
                         < (first[0], first[1])
                     ):
-                        member, lineno0, offset = bad_line
+                        member, lineno0 = bad_line
                         with open(member.path, "rb") as f:
-                            f.seek(offset)
+                            f.seek(member.bad_line_offsets[lineno0])
                             raw = f.readline()
                         try:
                             _convert(raw)
@@ -1739,13 +2073,18 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
 
 
 def _read_source_line(member, lineno0):
-    """The raw bytes of one prepared source line (for error reports)."""
-    for n, offset, _kind, _proj in _stream_line_entries(member.member_dir):
-        if n == lineno0:
-            with open(member.path, "rb") as f:
-                f.seek(offset)
-                return f.readline()
-    return b""
+    """The raw bytes of one prepared source line (for error reports).
+
+    Reads the prepared prefix sequentially: the source is append-only,
+    so the first ``member.lineno`` lines are exactly the prepared ones.
+    Works with or without the durable line index (online compaction
+    removes it).
+    """
+    with open(member.path, "rb") as f:
+        for _ in range(lineno0):
+            if not f.readline():
+                return b""
+        return f.readline()
 
 
 # ---------------------------------------------------------------------------
@@ -1818,6 +2157,14 @@ _CURSOR_VERSION = 1
 _STREAM_SESSIONS = {}
 _STREAM_LOCK = threading.Lock()
 _STREAM_TOKENS = itertools.count(1)
+# Stream sessions pin one open descriptor per member.  A cursor is
+# fully self-describing (inode + frozen length + policy per member), so
+# a session evicted from the registry -- by the idle reaper, the size
+# cap, or an explicit close_linked_logs_stream -- is transparently
+# rebuilt from the cursor on the next call; eviction never breaks a
+# live cursor.
+_STREAM_SESSION_TTL = 300.0       # idle seconds before a session is reaped
+_STREAM_SESSION_LIMIT = 256       # registry cap; LRU eviction beyond it
 
 
 def _open_path_wait(path, quiesce):
@@ -1914,16 +2261,61 @@ def _stream_policy(fds, ends, posts):
     return 0
 
 
+def _close_session_fds(session):
+    for fd in session["fds"]:
+        if fd is not None:
+            try:
+                fd.close()
+            except OSError:
+                pass
+
+
 def _drop_stream_session(token):
     with _STREAM_LOCK:
         session = _STREAM_SESSIONS.pop(token, None)
     if session is not None:
-        for fd in session["fds"]:
-            if fd is not None:
-                try:
-                    fd.close()
-                except OSError:
-                    pass
+        _close_session_fds(session)
+
+
+def _reap_stream_sessions():
+    """Reclaim pinned descriptors from idle/over-cap sessions.
+
+    A cursor is self-describing, so dropping a session here is lossless:
+    the next call rebuilds the pinned descriptors straight from the
+    cursor (same inodes and frozen lengths).  This bounds the number of
+    descriptors long-lived cursors may pin when callers abandon them
+    without exhausting the stream.
+    """
+    now = time.monotonic()
+    dead = []
+    with _STREAM_LOCK:
+        for token, session in list(_STREAM_SESSIONS.items()):
+            if now - session.get("at", now) > _STREAM_SESSION_TTL:
+                dead.append(_STREAM_SESSIONS.pop(token))
+        while len(_STREAM_SESSIONS) > _STREAM_SESSION_LIMIT:
+            oldest = min(
+                _STREAM_SESSIONS,
+                key=lambda t: _STREAM_SESSIONS[t].get("at", 0.0),
+            )
+            dead.append(_STREAM_SESSIONS.pop(oldest))
+    for session in dead:
+        _close_session_fds(session)
+
+
+def close_linked_logs_stream(cursor):
+    """Release the descriptors pinned for a still-open stream.
+
+    The cursor itself stays usable afterwards: it is self-describing,
+    so a later call reopens the pinned inodes and continues exactly
+    where it stopped.  This lets a caller that abandons a stream early
+    reclaim its descriptors immediately instead of waiting for the
+    idle reaper.  A non-string cursor raises :class:`TypeError`;
+    corrupt content raises :class:`ValueError`.
+    """
+    if not isinstance(cursor, str):
+        raise TypeError("cursor must be a string")
+    state = _decode_cursor(cursor)
+    _drop_stream_session(state["tok"])
 
 
 def _encode_cursor(token, session, mi, off):
@@ -2100,12 +2492,14 @@ def read_linked_logs_stream(groups, cursor=None, batch_records=4096, *,
 
     if cursor is None:
         _probe_members(paths)
+        _reap_stream_sessions()
         fds, ends, posts = _open_stream_session(paths, quiesce)
         session = {
             "fds": fds,
             "ends": ends,
             "inos": [os.fstat(fd.fileno()).st_ino for fd in fds],
             "pol": _stream_policy(fds, ends, posts),
+            "at": time.monotonic(),
         }
         token = f"{os.getpid()}-{next(_STREAM_TOKENS)}"
         with _STREAM_LOCK:
@@ -2116,12 +2510,18 @@ def read_linked_logs_stream(groups, cursor=None, batch_records=4096, *,
         if len(state["mem"]) != len(paths):
             raise ValueError("cursor does not match the group list")
         token = state["tok"]
+        # Reap idle/over-cap sessions first; a reaped session is
+        # transparently rebuilt from the self-describing cursor.
+        _reap_stream_sessions()
         with _STREAM_LOCK:
             session = _STREAM_SESSIONS.get(token)
         if session is None:
             session = _reopen_stream_session(paths, state, quiesce)
+            session["at"] = time.monotonic()
             with _STREAM_LOCK:
                 _STREAM_SESSIONS[token] = session
+        else:
+            session["at"] = time.monotonic()
         mi, off = state["mi"], state["off"]
 
     try:
