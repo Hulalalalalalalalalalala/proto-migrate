@@ -1133,7 +1133,8 @@ def _insert_into_live(path, pos, data, member_dir, parent):
 
 
 def _salvage_backup_tail(path, backup_path, offset, lineno, on_bad,
-                         audit_stream, member_dir, quiesce):
+                         audit_stream, member_dir, quiesce,
+                         moved_sink=None, bad_sink=None):
     """Converge records that exist only on the backup inode into the live
     file, before the backup is removed.
 
@@ -1207,6 +1208,8 @@ def _salvage_backup_tail(path, backup_path, offset, lineno, on_bad,
                         audit_stream.write(_audit_line(cur_lineno, raw))
                         audit_stream.flush()
                         skipped += 1
+                        if bad_sink is not None:
+                            bad_sink(raw)
                         idx += 1
                         continue
                     here = live.readline()
@@ -1221,9 +1224,13 @@ def _salvage_backup_tail(path, backup_path, offset, lineno, on_bad,
                 out, bad = _emit(audit_stream, on_bad, raw, cur_lineno)
                 if bad:
                     skipped += 1
+                    if bad_sink is not None:
+                        bad_sink(raw)
                     continue
                 insert.extend(out)
                 salvaged += 1
+                if moved_sink is not None:
+                    moved_sink(raw, out)
             if insert:
                 gens.append(_insert_into_live(
                     path, live_pos, insert, member_dir, parent))

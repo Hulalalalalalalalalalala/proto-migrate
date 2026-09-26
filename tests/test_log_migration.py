@@ -237,6 +237,19 @@ class TestIdempotency(unittest.TestCase):
         self.assertFalse(r2.replaced)
         self.assertEqual(read_bytes(self.path), first)
 
+    def test_idempotent_completion_reports_zero_counters(self):
+        # A canonical current-version file is left untouched and an
+        # idempotent completion reports zero moved records on the first
+        # run and every rerun (the cumulative scan counters live in the
+        # checkpoint, not in the result).
+        with open(self.path, "wb") as f:
+            f.write(v3("A") + v3("B") + v3("C"))
+        for _ in range(2):
+            result = migrate_log_file(self.path, quiesce=0.01)
+            self.assertFalse(result.replaced)
+            self.assertEqual(result.records_migrated, 0)
+            self.assertEqual(result.records_skipped, 0)
+
     def test_second_run_after_real_migration_byte_identical(self):
         with open(self.path, "wb") as f:
             f.write(v1("A") + v2("B"))

@@ -577,7 +577,8 @@ def _available_lines(fd, off):
 
 
 def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
-              audit_stream, on_bad, extra_gens=()):
+              audit_stream, on_bad, extra_gens=(), moved_sink=None,
+              bad_sink=None):
     """Drain appenders across the commit.
 
     Returns ``(salvaged, skipped, lineno, warning)``.  A repair I/O
@@ -651,9 +652,13 @@ def _converge(path, parent, tmp_dir, src, offset, lineno, quiesce,
         lineno_box[0] += 1
         if bad:
             skipped_box[0] += 1
+            if bad_sink is not None:
+                bad_sink(raw)
             return False
         buf.extend(out)
         salvaged_records += 1
+        if moved_sink is not None:
+            moved_sink(raw, out)
         return True
 
     def do_rebuild(cur_tail):
@@ -851,11 +856,16 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
 
                     if not dirty:
                         # Canonical current-version file, nothing
-                        # skipped: leave every byte untouched.
+                        # skipped: leave every byte untouched.  This is an
+                        # idempotent completion -- the invocation moved no
+                        # records, so its summary counters must be zero
+                        # (including when a resumed checkpoint already
+                        # covered the whole file); the cumulative scan
+                        # counters live in the checkpoint, not the result.
                         return MigrationResult(
                             path=path,
-                            records_migrated=migrated,
-                            records_skipped=skipped,
+                            records_migrated=0,
+                            records_skipped=0,
                             records_salvaged=0,
                             replaced=False,
                         )

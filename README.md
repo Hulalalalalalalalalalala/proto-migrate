@@ -388,6 +388,68 @@ siblings of that member, so every rename stays on one filesystem:
 These names are the committed layout (they differ deliberately from
 the single-group `.migrate-group-*` names).
 
+### Incremental migration: `delta-migrate-linked-logs`
+
+`delta-migrate-linked-logs` takes exactly the same `--group` / `--link`
+/ `--strict|--skip` input as `migrate-linked-logs` but migrates **only
+the rows appended since the previous migration**.  The baseline is a
+single local *reconciliation ledger*
+(`.migrate-delta-tmp-<hash>/ledger.json`, next to the first group's
+first member) published by the previous full or delta run; it is a plain
+local file with no remote dependency and is rebuilt at any time.
+
+    python3 -m proto_migrate delta-migrate-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id                # strict (default)
+    python3 -m proto_migrate delta-migrate-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id --skip
+
+Python entry point:
+
+```python
+from proto_migrate import migrate_linked_delta
+
+result = migrate_linked_delta(
+    [["orders.log"], ["details.log"]],
+    links=[(1, 0, "order_id", "order_id")],
+    on_bad="skip",
+)
+# result.fallback / result.fallback_reason
+# result.records_added / records_rewritten / records_skipped
+# result.references_dropped / records_salvaged
+# result.members: per-member DeltaMemberResult with the four counters
+```
+
+The reconciled prefix is **neither rescanned nor rewritten**: only the
+new suffix is tailed, resolved and written (its candidate starts from
+the prefix bytes verbatim).  New rows resolve against new rows *and* the
+ledger's prefix keys (including keys belonging to prefix rows skipped as
+bad records or carrying an illegal version key).  Appenders keep writing
+throughout with zero loss, zero duplication and original order; a kill at
+any point reruns only the unfinished part, and the summary counts only
+rows that continuation newly moves.  Per member the four reconciliation
+counters are **added** (new rows that survive), **rewritten** (added
+rows whose encoding changed), **skipped** (bad rows) and **dropped**
+(good rows discarded for bad references); they reconcile exactly with a
+full migration rerun over the same new input and the final file is
+byte-for-byte identical.  In strict mode the first bad line or bad
+reference of the new suffix (groups, members, then lines) raises
+`ValueError`; a non-sequence list raises `TypeError`, an empty or
+duplicate list raises `ValueError`, and a missing or unreadable member
+raises `FileNotFoundError` (CLI exit `1`).
+
+**Deterministic fallback.** When the ledger cannot anchor the run it is
+ignored and the whole group set is migrated through the same engine
+with an empty baseline — exactly one full migration — and the result
+marks `fallback=True` with the reason: `ledger-missing` (no ledger yet,
+an unknown member, or another group set), `ledger-corrupt` (unparseable
+content, another link set/policy, or a changed reconciled prefix), or
+`source-inode-changed` (a member replaced in place).  Leases are the
+same non-blocking per-member flocks a full linked run takes: a holder
+raises `MigrationLockedError`, and a holder that disappears is taken
+over from the durable checkpoints.
+
 ### Rehearsal: `rehearse-linked-logs`
 
 `rehearse-linked-logs` is a strictly **read-only preflight** with the
@@ -565,6 +627,7 @@ post-commit-crash backup convergence.
 - `proto_migrate.close_linked_stream(cursor) -> None` releases the descriptors pinned by an abandoned streaming cursor (also reaped automatically when idle or over the session cap).
 - `proto_migrate.rehearse_linked_logs(groups, links=..., ...) -> RehearsalReport` is the strictly read-only linked-migration preflight: per-member migration counts, globally ordered bad-record/bad-reference findings, the strict first-error attribution and the skip-mode drop list; it takes no leases and never modifies a file.
 - `proto_migrate.compact_linked_state(groups, links=..., ...) -> CompactResult` collapses linked-migration checkpoint logs, segments and per-line indexes into deterministic O(members) state that resumes byte-identically; also `proto_migrate.compact_workdir_checkpoint(member_dir)` for one member work directory.
+- `proto_migrate.migrate_linked_delta(groups, links=..., ...) -> DeltaMigrationResult` migrates only the rows appended since the previous linked migration, reconciled against a local ledger; the per-member result (`DeltaMemberResult`) gives added / rewritten / skipped / bad-reference-dropped counters, and `fallback`/`fallback_reason` report the deterministic full-migration fallback (`ledger-missing`, `ledger-corrupt`, `source-inode-changed`).
 - `proto_migrate.VERSIONS -> tuple[int, ...]` supported versions, ascending.
 - `proto_migrate.CURRENT_VERSION -> int` the version `dumps` writes.
 

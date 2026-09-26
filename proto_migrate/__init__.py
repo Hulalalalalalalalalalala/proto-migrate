@@ -42,6 +42,9 @@ __all__ = [
     "RehearsalDropped",
     "compact_linked_state",
     "CompactResult",
+    "migrate_linked_delta",
+    "DeltaMigrationResult",
+    "DeltaMemberResult",
     "BadRecordError",
     "GroupBadRecordError",
     "LinkedBadReferenceError",
@@ -54,6 +57,7 @@ __all__ = [
     "run_linked_cli",
     "run_rehearse_cli",
     "run_compact_cli",
+    "run_delta_cli",
 ]
 
 VERSIONS = (1, 2, 3)
@@ -219,4 +223,10 @@ from .compaction import (  # noqa: E402
     compact_linked_state,
     compact_workdir_checkpoint,
     run_compact_cli,
+)
+from .delta_migration import (  # noqa: E402
+    DeltaMemberResult,
+    DeltaMigrationResult,
+    migrate_linked_delta,
+    run_delta_cli,
 )

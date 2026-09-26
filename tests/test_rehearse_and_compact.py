@@ -645,6 +645,49 @@ class TestCompaction(unittest.TestCase):
                              norm(audit_a.getvalue()))
             self.assertEqual(leftovers(d2), lock_artifacts(d2))
 
+    def test_compact_resolve_interruption_recovers_reproducibly(self):
+        # A kill at compact-resolve (markers published, collapse not
+        # started) must be reproducible: a second compaction process
+        # finishes the collapse from the published markers, a third is
+        # idempotent, and the migration then stages byte-identical
+        # output without rescanning -- and restarting straight into the
+        # migration after the crash works just as well.
+        groups = build_pair(self.d, n=120)
+        self._prepare_crashed(groups, segment_size=200)
+        proc = run_compact_cli_subprocess(
+            groups, crash="compact-resolve", segment_size=200)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+        # Second process: takes the resolved-marker finish path.
+        proc = run_compact_cli_subprocess(
+            groups, crash="compact-resolve", segment_size=200)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for group in groups:
+            md = group[0] + ".migrate-linked-tmp"
+            self.assertEqual(cp_record_count(md), 1)
+            self.assertFalse(
+                os.path.exists(os.path.join(md, "lines")))
+
+        # Third compaction is an idempotent no-op.
+        again = compact_linked_state(groups, links=LINK, on_bad="skip",
+                                     quiesce=0.005, audit=io.BytesIO())
+        self.assertEqual(again.checkpoint_records_before, 2)
+        self.assertEqual(again.checkpoint_records_after, 2)
+
+        calls = []
+        original = lm.loads
+        lm.loads = lambda raw: (calls.append(raw), original(raw))[1]
+        try:
+            migrate_linked_logs(groups, links=LINK, on_bad="skip",
+                                quiesce=0.005, audit=io.BytesIO())
+        finally:
+            lm.loads = original
+        self.assertEqual(calls, [])
+        for group in groups:
+            recs = [json.loads(x)
+                    for x in read_bytes(group[0]).splitlines()]
+            self.assertEqual(len(recs), 120)
+
     def test_crash_at_every_compaction_point_recovers(self):
         groups = build_pair(self.d, n=120)
         self._prepare_crashed(groups, segment_size=200)
