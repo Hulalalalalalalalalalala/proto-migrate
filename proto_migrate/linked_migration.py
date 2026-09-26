@@ -152,6 +152,7 @@ __all__ = [
     "migrate_linked_logs",
     "read_linked_logs",
     "read_linked_logs_stream",
+    "close_linked_stream",
     "run_linked_cli",
 ]
 
@@ -620,7 +621,8 @@ def _count_line_entries(member_dir):
 
 class _LinkedMember:
     def __init__(self, index, group_index, path, member_dir, src, dirty,
-                 offset, lineno, run_migrated, run_skipped, fresh_from):
+                 offset, lineno, run_migrated, run_skipped, fresh_from,
+                 linked_final=False):
         self.index = index
         self.group_index = group_index
         self.path = path
@@ -637,6 +639,10 @@ class _LinkedMember:
         self.fresh_from = fresh_from
         self.salvaged = 0
         self.dropped = set()
+        # True when a compaction pass already produced the filtered
+        # output as ``linked-final`` (the member's per-line index may
+        # have been compacted away, so the filter is not rebuilt).
+        self.linked_final = linked_final
 
 
 def _prepare_linked_member(index, group_index, path, member_dir, on_bad,
@@ -1038,12 +1044,19 @@ def _stage_linked_member(member):
     path = member.path
     parent = os.path.dirname(os.path.abspath(path))
     d = _linked_debris(path)
-    src_name = _LINKED_FINAL if member.dropped else _FINAL
+    src_name = (
+        _LINKED_FINAL if (member.dropped or member.linked_final) else _FINAL
+    )
     os.replace(os.path.join(member.member_dir, src_name), d["staged"])
     _publish_member_marker(path)
     os.replace(path, d["backup"])
     os.replace(d["staged"], path)
     _fsync_dir(parent)
+
+
+def _member_will_stage(member):
+    """Whether this member's bytes change at the commit border."""
+    return bool(member.dirty or member.dropped or member.linked_final)
 
 
 def _undo_staged_members(members):
@@ -1547,104 +1560,136 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
 
             # --- PREPARE every member (resumed via local checkpoints).
             try:
-                index = 0
-                for group_index, group in enumerate(groups):
-                    for path in group:
-                        member_dir = _linked_member_dir(path)
-                        member = _resume_linked_prepared(
-                            index, group_index, path, member_dir, on_bad
-                        )
-                        if member is None:
-                            member = _prepare_linked_member(
-                                index, group_index, path, member_dir,
-                                on_bad, segment_size, quiesce,
-                                audit_stream,
+                # A prior compaction pass may have published resolved
+                # state: members then stage straight from their compacted
+                # final / linked-final, without a rescan, a rebuilt line
+                # index or a rebuilt reference database, and the spooled
+                # skip audits are replayed verbatim.  Byte-identical
+                # output to an uninterrupted run.
+                from .compaction import (
+                    group_resolved_path,
+                    member_resolved_path,
+                    read_resolved_json,
+                    resume_resolved_members,
+                )
+
+                resolved_marker = group_resolved_path(group_dir)
+                resolved_state = None
+                if read_resolved_json(resolved_marker) is not None:
+                    resolved_state = resume_resolved_members(
+                        groups, group_dir, links, on_bad, audit_stream
+                    )
+                    if resolved_state is None:
+                        # Marker unusable (member state lost): abandon
+                        # the compacted state and prepare every member
+                        # afresh; the members' own resume checks wipe the
+                        # directories whose line indexes are gone.
+                        _remove(resolved_marker)
+                        for group2 in groups:
+                            for path2 in group2:
+                                _remove(member_resolved_path(
+                                    _linked_member_dir(path2)))
+
+                if resolved_state is not None:
+                    members = resolved_state
+                else:
+                    index = 0
+                    for group_index, group in enumerate(groups):
+                        for path in group:
+                            member_dir = _linked_member_dir(path)
+                            member = _resume_linked_prepared(
+                                index, group_index, path, member_dir, on_bad
                             )
-                        members.append(member)
-                        index += 1
+                            if member is None:
+                                member = _prepare_linked_member(
+                                    index, group_index, path, member_dir,
+                                    on_bad, segment_size, quiesce,
+                                    audit_stream,
+                                )
+                            members.append(member)
+                            index += 1
                 _crash_point("linked-prepare")
 
-                # --- RESOLVE references from the durable line indexes.
-                # The spill database is rebuilt on every uncommitted
-                # run; building it reads only the per-member line
-                # indexes, never the sources.
-                refs_path = os.path.join(group_dir, _REFS_DB)
-                _remove(refs_path)
-                refs = _RefsDb(refs_path)
-                try:
-                    for member in members:
-                        refs.build_member(
-                            member,
-                            dst_links.get(member.group_index, []),
-                            src_links.get(member.group_index, []),
-                        )
-                    refs.validate()
-                    _crash_point("linked-refs")
-                    references_bad = refs.fresh_bad_edges()
-                    dropped = refs.dropped_lines()
-                    first = refs.first_bad()
-                finally:
-                    refs.close()
+                if resolved_state is None:
+                    # --- RESOLVE references from the durable line
+                    # indexes.  The spill database is rebuilt on every
+                    # uncommitted run; building it reads only the
+                    # per-member line indexes, never the sources.
+                    refs_path = os.path.join(group_dir, _REFS_DB)
+                    _remove(refs_path)
+                    refs = _RefsDb(refs_path)
+                    try:
+                        for member in members:
+                            refs.build_member(
+                                member,
+                                dst_links.get(member.group_index, []),
+                                src_links.get(member.group_index, []),
+                            )
+                        refs.validate()
+                        _crash_point("linked-refs")
+                        references_bad = refs.fresh_bad_edges()
+                        dropped = refs.dropped_lines()
+                        first = refs.first_bad()
+                    finally:
+                        refs.close()
 
-                if on_bad == "strict":
-                    # The globally first problem -- bad line or bad
-                    # reference, in group/member/line order -- decides
-                    # which exception is raised.  Bad lines were
-                    # deferred during prepare, so every member's first
-                    # bad line is on record; a bad reference that sorts
-                    # before a later member's bad line is reported
-                    # first.
-                    bad_line = None
-                    for member in members:
-                        hit = _first_indexed_bad_line(member)
-                        if hit is not None:
-                            bad_line = (member, hit[0], hit[1])
-                            break
-                    if bad_line is not None and (
-                        first is None
-                        or (bad_line[0].index, bad_line[1])
-                        < (first[0], first[1])
-                    ):
-                        member, lineno0, offset = bad_line
-                        with open(member.path, "rb") as f:
-                            f.seek(offset)
-                            raw = f.readline()
-                        try:
-                            _convert(raw)
-                            cause = ValueError("undecodable record")
-                        except ValueError as exc:
-                            cause = exc
-                        raise GroupBadRecordError(
-                            member.path, lineno0 + 1, raw, cause
-                        )
-                    if first is not None:
-                        mi, lineno0, reason, link_id, value = first
-                        member = members[mi]
-                        src_g, dst_g, src_field, dst_field = links[link_id]
-                        raw = _read_source_line(member, lineno0)
-                        raise LinkedBadReferenceError(
-                            member.path, lineno0 + 1, raw,
-                            f"{_REASON_TEXT[reason]}: "
-                            f"{dst_field}={value!r} in group {dst_g}",
-                        )
+                    if on_bad == "strict":
+                        # The globally first problem -- bad line or bad
+                        # reference, in group/member/line order -- decides
+                        # which exception is raised.  Bad lines were
+                        # deferred during prepare, so every member's first
+                        # bad line is on record; a bad reference that sorts
+                        # before a later member's bad line is reported
+                        # first.
+                        bad_line = None
+                        for member in members:
+                            hit = _first_indexed_bad_line(member)
+                            if hit is not None:
+                                bad_line = (member, hit[0], hit[1])
+                                break
+                        if bad_line is not None and (
+                            first is None
+                            or (bad_line[0].index, bad_line[1])
+                            < (first[0], first[1])
+                        ):
+                            member, lineno0, offset = bad_line
+                            with open(member.path, "rb") as f:
+                                f.seek(offset)
+                                raw = f.readline()
+                            try:
+                                _convert(raw)
+                                cause = ValueError("undecodable record")
+                            except ValueError as exc:
+                                cause = exc
+                            raise GroupBadRecordError(
+                                member.path, lineno0 + 1, raw, cause
+                            )
+                        if first is not None:
+                            mi, lineno0, reason, link_id, value = first
+                            member = members[mi]
+                            src_g, dst_g, src_field, dst_field = links[link_id]
+                            raw = _read_source_line(member, lineno0)
+                            raise LinkedBadReferenceError(
+                                member.path, lineno0 + 1, raw,
+                                f"{_REASON_TEXT[reason]}: "
+                                f"{dst_field}={value!r} in group {dst_g}",
+                            )
 
-                # --- FILTER bad-reference records out of the output.
-                for member in members:
-                    member.dropped = dropped.get(member.index, set())
-                    if member.dropped:
-                        if on_bad == "skip":
-                            _audit_dropped(member, audit_stream)
-                        _write_linked_final(member)
-                        fresh_drops = sum(
-                            1 for n in member.dropped
-                            if n >= member.fresh_from
-                        )
-                        member.run_migrated -= fresh_drops
+                    # --- FILTER bad-reference records out of the output.
+                    for member in members:
+                        member.dropped = dropped.get(member.index, set())
+                        if member.dropped:
+                            if on_bad == "skip":
+                                _audit_dropped(member, audit_stream)
+                            _write_linked_final(member)
+                            fresh_drops = sum(
+                                1 for n in member.dropped
+                                if n >= member.fresh_from
+                            )
+                            member.run_migrated -= fresh_drops
                 _crash_point("linked-filter")
 
-                staged_members = [
-                    m for m in members if m.dirty or m.dropped
-                ]
+                staged_members = [m for m in members if _member_will_stage(m)]
                 if not staged_members:
                     # Everything already canonical and every reference
                     # intact: nothing renamed, all work swept (mirrors
@@ -1711,7 +1756,7 @@ def migrate_linked_logs(groups, *, links=(), on_bad="strict",
     # records) reports zero, so member-level and group-level counts
     # always agree, and a resumed or idempotent run reports zero.
     def rewritten(m):
-        return m.dirty or bool(m.dropped)
+        return _member_will_stage(m)
 
     totals_migrated = sum(m.run_migrated for m in members if rewritten(m))
     totals_skipped = sum(m.run_skipped for m in members if rewritten(m))
@@ -1818,6 +1863,81 @@ _CURSOR_VERSION = 1
 _STREAM_SESSIONS = {}
 _STREAM_LOCK = threading.Lock()
 _STREAM_TOKENS = itertools.count(1)
+
+# A pinned snapshot that a caller abandons (its cursor is never resumed
+# and never closed) must not pin its member file descriptors for the
+# whole process lifetime.  Sessions idle past the TTL are reaped --
+# their descriptors are closed and reclaimable -- and a hard cap evicts
+# the stalest sessions; the TTL is overridable for tests.  A resumed
+# cursor whose session was reaped rebuilds it from the pinned
+# (inode, length) pairs exactly like a cursor persisted across
+# processes, so reaping never changes snapshot semantics.
+_STREAM_IDLE_TTL = 60.0
+_STREAM_MAX_SESSIONS = 64
+
+
+def _stream_idle_ttl():
+    override = os.environ.get("PROTO_MIGRATE_STREAM_IDLE_MS")
+    if override:
+        try:
+            return max(0.0, float(override) / 1000.0)
+        except ValueError:
+            pass
+    return _STREAM_IDLE_TTL
+
+
+def _reap_stream_sessions(keep_token=None):
+    """Close descriptors of abandoned (idle/over-cap) sessions.
+
+    Must be called with ``_STREAM_LOCK`` held.  The newest session is
+    protected from the cap while it is being created.
+    """
+    now = time.monotonic()
+    ttl = _stream_idle_ttl()
+
+    def retire(token):
+        session = _STREAM_SESSIONS.pop(token, None)
+        if session is None:
+            return
+        for fd in session["fds"]:
+            if fd is not None:
+                try:
+                    fd.close()
+                except OSError:
+                    pass
+
+    stale = [
+        token for token, session in _STREAM_SESSIONS.items()
+        if token != keep_token and now - session["atime"] >= ttl
+    ]
+    for token in stale:
+        retire(token)
+    excess = len(_STREAM_SESSIONS) - _STREAM_MAX_SESSIONS
+    if excess > 0:
+        oldest = sorted(
+            _STREAM_SESSIONS.items(), key=lambda kv: kv[1]["atime"]
+        )
+        for token, _session in oldest[:excess]:
+            if token != keep_token:
+                retire(token)
+
+
+def close_linked_stream(cursor):
+    """Release the descriptors pinned by a streaming snapshot cursor.
+
+    A fully drained stream releases its own descriptors; use this to
+    release a stream that is abandoned before exhaustion.  ``None`` is a
+    no-op.  A non-string cursor raises :class:`TypeError` and corrupt
+    cursor content raises :class:`ValueError`, matching the read
+    taxonomy.  Releasing an unknown (already released or reaped) cursor
+    is a no-op: its pinned inodes are simply no longer held here.
+    """
+    if cursor is None:
+        return
+    if not isinstance(cursor, str):
+        raise TypeError("cursor must be a string or None")
+    state = _decode_cursor(cursor)
+    _drop_stream_session(state["tok"])
 
 
 def _open_path_wait(path, quiesce):
@@ -2109,7 +2229,9 @@ def read_linked_logs_stream(groups, cursor=None, batch_records=4096, *,
         }
         token = f"{os.getpid()}-{next(_STREAM_TOKENS)}"
         with _STREAM_LOCK:
+            session["atime"] = time.monotonic()
             _STREAM_SESSIONS[token] = session
+            _reap_stream_sessions(keep_token=token)
         mi = off = 0
     else:
         state = _decode_cursor(cursor)
@@ -2121,7 +2243,12 @@ def read_linked_logs_stream(groups, cursor=None, batch_records=4096, *,
         if session is None:
             session = _reopen_stream_session(paths, state, quiesce)
             with _STREAM_LOCK:
+                session["atime"] = time.monotonic()
                 _STREAM_SESSIONS[token] = session
+                _reap_stream_sessions(keep_token=token)
+        else:
+            with _STREAM_LOCK:
+                session["atime"] = time.monotonic()
         mi, off = state["mi"], state["off"]
 
     try:

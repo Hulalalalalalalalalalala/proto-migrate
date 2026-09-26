@@ -34,6 +34,14 @@ __all__ = [
     "migrate_linked_logs",
     "read_linked_logs",
     "read_linked_logs_stream",
+    "close_linked_stream",
+    "rehearse_linked_logs",
+    "RehearsalReport",
+    "RehearsalMember",
+    "RehearsalFinding",
+    "RehearsalDropped",
+    "compact_linked_state",
+    "CompactResult",
     "BadRecordError",
     "GroupBadRecordError",
     "LinkedBadReferenceError",
@@ -44,6 +52,8 @@ __all__ = [
     "run_cli",
     "run_group_cli",
     "run_linked_cli",
+    "run_rehearse_cli",
+    "run_compact_cli",
 ]
 
 VERSIONS = (1, 2, 3)
@@ -190,8 +200,23 @@ from .linked_migration import (  # noqa: E402
     LinkedBadReferenceError,
     LinkedMigrationResult,
     MigrationLockedError,
+    close_linked_stream,
     migrate_linked_logs,
     read_linked_logs,
     read_linked_logs_stream,
     run_linked_cli,
+)
+from .rehearsal import (  # noqa: E402
+    RehearsalDropped,
+    RehearsalFinding,
+    RehearsalMember,
+    RehearsalReport,
+    rehearse_linked_logs,
+    run_rehearse_cli,
+)
+from .compaction import (  # noqa: E402
+    CompactResult,
+    compact_linked_state,
+    compact_workdir_checkpoint,
+    run_compact_cli,
 )
