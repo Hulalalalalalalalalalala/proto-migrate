@@ -7,6 +7,7 @@ import sys
 from . import CURRENT_VERSION, VERSIONS, dumps, loads, migrate, run_cli
 from .group_migration import run_group_cli
 from .linked_migration import run_linked_cli
+from .delta_migration import run_delta_cli
 from .rehearsal import run_rehearse_cli
 from .compaction import run_compact_cli
 
@@ -99,6 +100,8 @@ def main(argv=None):
         return run_group_cli(args[1:])
     if args and args[0] == "migrate-linked-logs":
         return run_linked_cli(args[1:])
+    if args and args[0] == "delta-migrate-linked-logs":
+        return run_delta_cli(args[1:])
     if args and args[0] == "rehearse-linked-logs":
         return run_rehearse_cli(args[1:])
     if args and args[0] == "compact-linked-logs":
@@ -109,6 +112,9 @@ def main(argv=None):
         "       python3 -m proto_migrate migrate-logs FILE [FILE ...] "
         "[--strict|--skip]\n"
         "       python3 -m proto_migrate migrate-linked-logs "
+        "--group FILE [FILE ...] [--group ...] "
+        "[--link SRC:DST:SRC_FIELD:DST_FIELD] [--strict|--skip]\n"
+        "       python3 -m proto_migrate delta-migrate-linked-logs "
         "--group FILE [FILE ...] [--group ...] "
         "[--link SRC:DST:SRC_FIELD:DST_FIELD] [--strict|--skip]\n"
         "       python3 -m proto_migrate rehearse-linked-logs "

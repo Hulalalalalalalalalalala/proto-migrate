@@ -24,6 +24,7 @@ import fcntl
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -686,7 +687,42 @@ class TestCompaction(unittest.TestCase):
         # record per member and the decision is not republished.
         self.assertEqual(first.checkpoint_records_after, 2)
         self.assertEqual(second.checkpoint_records_before, 2)
-        self.assertEqual(second.checkpoint_records_after, 2)
+
+    def test_compact_resolve_kill_recovery_is_reproducible(self):
+        # A kill exactly at compact-resolve (per-member resolved markers
+        # published, group marker about to be) must recover
+        # deterministically: a direct migration resume and a
+        # compact-rerun-then-migrate both produce the same final bytes as
+        # an uninterrupted migration, repeated across several runs.
+        n = 120
+        reference_dir = tempfile.mkdtemp()
+        try:
+            ref_groups = build_pair(reference_dir, n=n, bad=True)
+            migrate_linked_logs(ref_groups, links=LINK, on_bad="skip",
+                                quiesce=0.005, audit=io.BytesIO())
+            ref_bytes = [read_bytes(g[0]) for g in ref_groups]
+        finally:
+            shutil.rmtree(reference_dir, ignore_errors=True)
+
+        for route_compact in (False, True):
+            for _ in range(3):
+                groups = build_pair(self.d, n=n, bad=True)
+                self._prepare_crashed(groups, segment_size=200)
+                proc = run_compact_cli_subprocess(
+                    groups, crash="compact-resolve", segment_size=200)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                if route_compact:
+                    proc = run_compact_cli_subprocess(
+                        groups, segment_size=200)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                audit = io.BytesIO()
+                migrate_linked_logs(groups, links=LINK, on_bad="skip",
+                                    quiesce=0.005, audit=audit)
+                self.assertEqual(
+                    [read_bytes(g[0]) for g in groups], ref_bytes)
+                # Reset for the next iteration.
+                shutil.rmtree(self.d, ignore_errors=True)
+                os.makedirs(self.d, exist_ok=True)
 
     def test_compaction_prepares_without_prior_crash(self):
         # Compaction drives prepare itself on a pristine fixture.

@@ -478,6 +478,80 @@ bad line or bad reference is raised (as `GroupBadRecordError` /
 `LinkedBadReferenceError`) before any resolved marker is published; a
 member leased to a live instance raises `MigrationLockedError`.
 
+### Incremental migration: `delta-migrate-linked-logs`
+
+`delta-migrate-linked-logs` is the incremental companion of
+`migrate-linked-logs` with the **same `--group` / `--link` /
+`--strict|--skip` input shape** — it only migrates the rows appended
+since the previous migration; the already reconciled prefix is neither
+rescanned nor rewritten:
+
+    python3 -m proto_migrate delta-migrate-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id                # strict (default)
+    python3 -m proto_migrate delta-migrate-linked-logs \
+        --group orders.log --group details.log \
+        --link 1:0:order_id:order_id --skip
+
+Python entry point:
+
+```python
+from proto_migrate import migrate_linked_delta
+
+result = migrate_linked_delta(
+    [["orders.log"], ["details.log"]],
+    links=[(1, 0, "order_id", "order_id")],
+    on_bad="strict",            # or "skip"
+)
+# result.records_added / records_rewritten / records_skipped /
+# records_dropped / references_bad / members / fallback / fallback_reason
+```
+
+**Local reconciliation ledger.** Each member keeps a small local
+ledger, `<file>.migrate-delta-ledger`, pinned to the member's live
+inode. It records the byte offset and output-line count of the
+reconciled prefix plus the surviving reference-target keys of that
+prefix per declared link, so a new row referencing an old key resolves
+without a prefix rescan. The ledger lives only in local files, has no
+remote dependency and can always be rebuilt. If it is **missing,
+corrupt/unreadable, names a different group/link/policy configuration,
+or its source inode has changed** (for example an intervening full
+migration renamed the file), the run deterministically **falls back to
+a full migration** — every member processed from byte zero through the
+identical prepare/resolve/commit pipeline — and the result names the
+cause in `fallback_reason` (`fallback=True`).
+
+**Counters.** Each member reports four reconciliation counts for the
+rows this invocation settles: `lines_added` (appended rows),
+`records_rewritten` (surviving appended rows whose bytes change),
+`records_skipped` (appended bad records) and `records_dropped`
+(appended good records discarded for a bad reference); the group total
+additionally gives `references_bad` (bad references among the new
+rows). The four counts equal the summary of a full migration of the
+same appended segment, and the finished files are **byte-for-byte
+identical** to one uninterrupted full migration of the total content.
+An idle rerun reports all four counters as zero and renames nothing.
+
+**Leases, appenders and crashes.** The lease semantics are the full
+entry's: overlapping members are mutually exclusive, disjoint group
+sets advance in parallel, and a lease held by a live instance raises
+`MigrationLockedError`; a holder that finishes or disappears releases
+the lease via the OS and the next instance takes over from durable
+state. A continuously appending writer is drained with zero loss, zero
+duplication and original order. Killed at any point, a rerun completes
+only the unfinished part: prepared members are not rescanned, and a
+durable per-segment summary means the recovering run reports the same
+counters the uninterrupted run would (a further idle rerun reports
+zero). In strict mode the global first bad line *or* bad reference is
+raised (group, then member, then line order) as
+`LinkedBadReferenceError` / `GroupBadRecordError` (both `ValueError`)
+before any rename. The group commit marker `delta-committed` (in
+`.migrate-delta-tmp-<hash>/` next to the first group's first member) is
+the single success/failure border; the per-member work directories are
+`<file>.migrate-delta-tmp/`. The exit-code and exception taxonomy is the
+full linked entry's: non-sequence `TypeError`, empty/duplicate
+`ValueError`, missing/unreadable member `FileNotFoundError` (CLI `1`).
+
 ### Durability, resume and snapshots
 
 Every member is prepared with the same fsynced segments and durable
@@ -548,7 +622,15 @@ linked-migration tests additionally cover the streaming snapshot cursor
 TypeError/ValueError/FileNotFoundError taxonomy), multi-instance leases
 (mutual exclusion on overlapping members, parallel disjoint instances,
 crash takeover), the strict-mode global first-error ordering, and
-post-commit-crash backup convergence.
+post-commit-crash backup convergence.  The delta-migration tests cover
+incremental-only processing against a local ledger, equality of the
+per-member counters and final bytes with a full migration of the same
+appended segment, the missing/corrupt/inode-changed/configuration
+fallback reasons, real `SIGKILL` injection at every delta protocol
+point with byte-identical recovery and durable summary replay, a
+continuously appending writer (zero loss/duplication, original order),
+the non-blocking lease semantics, and the single-file idempotent
+counter fix.
 
 ## Public interface
 
@@ -560,6 +642,7 @@ post-commit-crash backup convergence.
 - `proto_migrate.migrate_log_group(paths, ...) -> GroupMigrationResult` migrates an explicit group of logs as one all-or-nothing unit.
 - `proto_migrate.read_log_group(paths) -> list[dict]` returns one version-consistent snapshot of a whole group.
 - `proto_migrate.migrate_linked_logs(groups, links=..., ...) -> LinkedMigrationResult` migrates several groups with cross-group reference integrity as one all-or-nothing unit; raises `MigrationLockedError` while a needed member lease is held by a live instance.
+- `proto_migrate.migrate_linked_delta(groups, links=..., ...) -> DeltaMigrationResult` incrementally migrates only the rows appended since the previous migration, reconciled by a local per-member ledger; deterministically falls back to a full migration (with a `fallback_reason`) when the ledger is missing, corrupt, configuration-stale or inode-changed; per member it reports lines added, records rewritten, records skipped and records dropped for bad references.
 - `proto_migrate.read_linked_logs(groups) -> list[list[dict]]` returns one version-consistent snapshot across all linked groups.
 - `proto_migrate.read_linked_logs_stream(groups, cursor=None, batch_records=...) -> (list[dict], str | None)` returns the same snapshot in cursor-resumable, member-aligned batches.
 - `proto_migrate.close_linked_stream(cursor) -> None` releases the descriptors pinned by an abandoned streaming cursor (also reaped automatically when idle or over the session cap).

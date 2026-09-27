@@ -851,11 +851,16 @@ def migrate_log_file(path, *, on_bad="strict", segment_size=DEFAULT_SEGMENT_SIZE
 
                     if not dirty:
                         # Canonical current-version file, nothing
-                        # skipped: leave every byte untouched.
+                        # skipped: leave every byte untouched.  This is
+                        # an idempotent no-op whether the scan was fresh
+                        # or resumed from a checkpoint, so the summary
+                        # counts only records this invocation newly
+                        # migrates -- which is zero (the cumulative
+                        # checkpoint counts describe earlier runs).
                         return MigrationResult(
                             path=path,
-                            records_migrated=migrated,
-                            records_skipped=skipped,
+                            records_migrated=0,
+                            records_skipped=0,
                             records_salvaged=0,
                             replaced=False,
                         )

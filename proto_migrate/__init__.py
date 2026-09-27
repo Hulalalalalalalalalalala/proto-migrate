@@ -32,6 +32,9 @@ __all__ = [
     "migrate_log_group",
     "read_log_group",
     "migrate_linked_logs",
+    "migrate_linked_delta",
+    "DeltaMigrationResult",
+    "DeltaMemberResult",
     "read_linked_logs",
     "read_linked_logs_stream",
     "close_linked_stream",
@@ -205,6 +208,12 @@ from .linked_migration import (  # noqa: E402
     read_linked_logs,
     read_linked_logs_stream,
     run_linked_cli,
+)
+from .delta_migration import (  # noqa: E402
+    DeltaMemberResult,
+    DeltaMigrationResult,
+    migrate_linked_delta,
+    run_delta_cli,
 )
 from .rehearsal import (  # noqa: E402
     RehearsalDropped,
